@@ -1,12 +1,13 @@
 :root {
-  --hud-bg: rgba(15, 20, 17, 0.56);
-  --hud-bg-hover: rgba(24, 32, 27, 0.78);
+  --hud-bg: rgba(15, 20, 17, 0.58);
+  --hud-bg-hover: rgba(24, 32, 27, 0.8);
   --hud-border: rgba(214, 224, 212, 0.14);
   --hud-border-active: rgba(214, 224, 212, 0.34);
   --text-primary: rgba(242, 245, 238, 0.94);
   --text-secondary: rgba(206, 216, 202, 0.72);
   --accent-moss: #8eb67e;
   --accent-amber: #e2a452;
+  --accent-crimson: #e06b58;
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
@@ -170,26 +171,133 @@ body {
   background: var(--accent-amber);
 }
 
-/* Bottom-Center Prompt */
-.interaction-prompt {
+/* Bottom-Center Stack (Reaction Badge + Auto-Hiding Stamina Bar + Prompt) */
+.hud-bottom-center {
   position: absolute;
-  bottom: 20px;
+  bottom: 18px;
   left: 50%;
   transform: translateX(-50%);
-  padding: 8px 15px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100vw - 32px);
+}
+
+.hidden-fade {
+  opacity: 0 !important;
+  transform: translateY(6px);
+  pointer-events: none;
+}
+
+/* Dynamic Reaction Alert Pill (Rat Panic / Slip / Thunder / Winded) */
+.reaction-badge {
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: rgba(34, 20, 16, 0.82);
+  border: 1px solid rgba(224, 107, 88, 0.48);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #f8d8ce;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.34);
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 220ms ease, transform 220ms ease;
+}
+
+.reaction-badge.calm {
+  background: rgba(22, 27, 23, 0.78);
+  border-color: rgba(226, 164, 82, 0.42);
+  color: #f2e0be;
+}
+
+/* Sleek Auto-Hiding Stamina Gauge */
+.stamina-container {
+  width: 248px;
+  padding: 7px 12px 9px;
+  border-radius: 10px;
+  background: var(--hud-bg);
+  border: 1px solid var(--hud-border);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 320ms ease, transform 320ms ease, border-color 180ms ease;
+}
+
+.stamina-container.exhausted {
+  border-color: rgba(224, 107, 88, 0.55);
+}
+
+.stamina-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 5px;
+  font-size: 0.69rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.stamina-label {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.stamina-container.exhausted .stamina-label {
+  color: var(--accent-crimson);
+}
+
+.stamina-pct {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.stamina-track {
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.stamina-fill {
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #74a66a, #a8d48c);
+  transition: width 70ms linear, background 200ms ease;
+}
+
+.stamina-fill.low {
+  background: linear-gradient(90deg, #d28a3d, #efc068);
+}
+
+.stamina-fill.exhausted {
+  background: linear-gradient(90deg, #c94e3f, #eb866e);
+}
+
+/* Bottom-Center Prompt */
+.interaction-prompt {
+  padding: 7px 14px;
   border-radius: 999px;
   background: var(--hud-bg);
   border: 1px solid var(--hud-border);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
-  font-size: 0.78rem;
+  font-size: 0.76rem;
   font-weight: 500;
   color: var(--text-secondary);
   white-space: nowrap;
-  max-width: calc(100vw - 40px);
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
-  transition: border-color 160ms ease, color 160ms ease, background 160ms ease, opacity 200ms ease;
+  transition: border-color 160ms ease, color 160ms ease, background 160ms ease;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.26);
 }
 
@@ -302,6 +410,46 @@ body {
   opacity: 1;
 }
 
+/* Bottom-Right Keybind Legend */
+.keybind-legend {
+  position: absolute;
+  bottom: 18px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 11px;
+  border-radius: 9px;
+  background: var(--hud-bg);
+  border: 1px solid var(--hud-border);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+}
+
+.kb-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.kb-item kbd {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--text-primary);
+}
+
+.kb-sep {
+  opacity: 0.35;
+}
+
 /* Stats.js Dock Placement (neatly below top-left HUD header) */
 .forest-stats {
   position: fixed !important;
@@ -337,7 +485,7 @@ body {
   --padding: 6px;
   --spacing: 5px;
   --widget-height: 22px;
-  --name-width: 48%;
+  --name-width: 50%;
   top: 16px !important;
   right: 16px !important;
   border-radius: 10px;
@@ -403,13 +551,22 @@ body {
   transition: width 240ms ease;
 }
 
+@media (max-width: 1120px) {
+  .keybind-legend {
+    display: none;
+  }
+}
+
 @media (max-width: 720px) {
   .hud-dock {
-    bottom: 62px;
+    bottom: 72px;
+  }
+
+  .hud-bottom-center {
+    bottom: 12px;
   }
 
   .interaction-prompt {
-    bottom: 14px;
     font-size: 0.72rem;
     padding: 6px 12px;
   }

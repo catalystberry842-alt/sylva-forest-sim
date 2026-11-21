@@ -1,14 +1,18 @@
 import * as THREE from 'three';
-import { lerp } from '../utils/random.js';
+import { lerp, clamp } from '../utils/random.js';
 
 const STREAM_Z_MIN = -120;
 const STREAM_Z_MAX = 120;
 const WIDTH_SEGMENTS = 48;
 const LENGTH_SEGMENTS = 260;
+const MAX_IMPACT_RIPPLES = 10;
+const SPLASH_POOL_SIZE = 240;
+const SPLASH_GRAVITY = -13.5;
 
 /**
  * Procedural meandering forest stream ribbon with custom WebGL2-safe GLSL water shader:
  * - Dual-scrolling downstream ripple waves + cross wind chop + concentric raindrop rings
+ * - Dynamic expanding impact ripples & pooled glistening splash droplet bursts
  * - Schlick Fresnel sky reflection + crisp sun/moon specular glints
  * - Exponential depth color absorption (warm emerald shallows -> deep forest teal)
  * - Animated noise-broken shoreline foam + downstream riffle highlights
@@ -18,6 +22,13 @@ export class StreamWater {
   constructor(terrain, windSystem = null) {
     this.terrain = terrain;
     this.windSystem = windSystem;
+    this.maxImpactRipples = MAX_IMPACT_RIPPLES;
+
+    this._impactRippleCursor = 0;
+    this._lastElapsed = 0.0;
+    this._splashCursor = 0;
+    this._activeSplashCount = 0;
+    this._splashDirty = false;
 
     this.uniforms = {
       uTime: { value: 0.0 },
@@ -36,6 +47,12 @@ export class StreamWater {
           ? windSystem.uniforms.uWindDir.value.clone()
           : new THREE.Vector2(1.0, 0.0),
       },
+      uImpactRipples: {
+        value: Array.from(
+          { length: MAX_IMPACT_RIPPLES },
+          () => new THREE.Vector4(0, 0, -100, 0)
+        ),
+      },
     };
 
     this.geometry = this._buildRibbonGeometry();
@@ -46,6 +63,10 @@ export class StreamWater {
     this.mesh.renderOrder = 2;
     this.mesh.receiveShadow = false;
     this.mesh.castShadow = false;
+
+    // Pooled sparkling water splash droplet system attached to the stream mesh
+    this.splashPoints = this._buildSplashParticles();
+    this.mesh.add(this.splashPoints);
   }
 
   _buildRibbonGeometry() {
@@ -250,6 +271,7 @@ export class StreamWater {
         uniform float uRainIntensity;
         uniform float uWindSpeed;
         uniform vec2 uWindDir;
+        uniform vec4 uImpactRipples[10];
 
         varying vec3 vWorldPos;
         varying vec2 vUv;
@@ -412,6 +434,53 @@ export class StreamWater {
             worldSlope += vec2( ( rX - rC ) / rEps, ( rZ - rC ) / rEps ) * rainBump;
           }
 
+          // Dynamic expanding concentric impact ripples (wading, running, jumping, slipping)
+          float impactFoam = 0.0;
+          float rippleDepthMask = smoothstep( 0.01, 0.10, depth );
+          for ( int i = 0; i < 10; i++ ) {
+            vec4 r = uImpactRipples[i];
+            float rStrength = r.w;
+            float age = uTime - r.z;
+            if ( rStrength > 0.001 && age >= 0.0 && age < 2.8 ) {
+              vec2 dVec = vWorldPos.xz - r.xy;
+              float dist = length( dVec );
+              float ringRadius = age * 2.45;
+              float radialDiff = dist - ringRadius;
+
+              float bandWidth = 0.34 + age * 0.22;
+              float spatialEnv = exp( -( radialDiff * radialDiff ) / ( bandWidth * bandWidth ) );
+
+              // Secondary trailing concentric ring slightly behind the main wavefront
+              float trailRadius = max( ringRadius - 0.56, 0.0 );
+              float trailDiff = dist - trailRadius;
+              float trailWidth = bandWidth * 1.15;
+              float trailEnv = exp( -( trailDiff * trailDiff ) / ( trailWidth * trailWidth ) )
+                             * 0.54 * smoothstep( 0.14, 0.42, age );
+
+              float timeFade = smoothstep( 0.0, 0.06, age ) * ( 1.0 - smoothstep( 1.65, 2.8, age ) );
+              float distAtten = 1.0 / ( 1.0 + dist * 0.42 );
+              float amp = rStrength * timeFade * distAtten * rippleDepthMask;
+
+              float waveK = 12.5;
+              float waveSlope = cos( radialDiff * waveK ) * spatialEnv
+                              + cos( trailDiff * ( waveK * 1.24 ) ) * trailEnv;
+              float waveCrest = max( sin( radialDiff * waveK ), 0.0 ) * spatialEnv
+                              + max( sin( trailDiff * ( waveK * 1.24 ) ), 0.0 ) * trailEnv * 0.62;
+
+              vec2 radialDir = dist > 0.001 ? ( dVec / dist ) : vec2( 0.0 );
+              worldSlope += radialDir * ( waveSlope * amp * 0.42 );
+
+              float earlyFroth = 0.48 + 0.34 * ( 1.0 - smoothstep( 0.0, 1.2, age ) );
+              impactFoam += waveCrest * amp * earlyFroth;
+
+              // Brief white splash-entry boil right at the impact epicenter
+              float centerSplash = exp( -( dist * dist ) / ( 0.16 + age * 0.36 ) )
+                                 * ( 1.0 - smoothstep( 0.05, 0.65, age ) )
+                                 * rStrength * rippleDepthMask;
+              impactFoam += centerSplash * 0.54;
+            }
+          }
+
           vec3 N = normalize( vec3( -worldSlope.x, 1.0, -worldSlope.y ) );
           vec3 V = normalize( cameraPosition - vWorldPos );
           vec3 L = normalize( uSunDir );
@@ -480,7 +549,8 @@ export class StreamWater {
           float riffleMask = smoothstep( 0.08, 0.24, depth ) * ( 1.0 - smoothstep( 0.26, 0.72, depth ) );
           float riffleFoam = smoothstep( 0.16, 0.36, waveSteepness ) * riffleMask * smoothstep( 0.48, 0.78, foamFine ) * 0.36;
 
-          float foamAmount = clamp( foamEdge + riffleFoam, 0.0, 0.72 );
+          float impactCrestFoam = clamp( impactFoam * ( 0.72 + foamFine * 0.38 ), 0.0, 0.86 );
+          float foamAmount = clamp( foamEdge + riffleFoam + impactCrestFoam, 0.0, 0.88 );
           vec3 foamAlbedo = vec3( 0.91, 0.94, 0.90 );
           vec3 foamLit = foamAlbedo * ( uSkyHorizonColor * 0.42 + uSunColor * max( L.y, 0.06 ) * ( 0.08 + uSunIntensity * 0.56 ) );
           waterColor = mix( waterColor, foamLit, foamAmount );
@@ -503,6 +573,235 @@ export class StreamWater {
     });
   }
 
+  _buildSplashParticles() {
+    this._splashPositions = new Float32Array(SPLASH_POOL_SIZE * 3);
+    this._splashVelocities = new Float32Array(SPLASH_POOL_SIZE * 3);
+    this._splashSizes = new Float32Array(SPLASH_POOL_SIZE);
+    this._splashAlphas = new Float32Array(SPLASH_POOL_SIZE);
+    this._splashAges = new Float32Array(SPLASH_POOL_SIZE);
+    this._splashLifetimes = new Float32Array(SPLASH_POOL_SIZE);
+    this._splashActive = new Uint8Array(SPLASH_POOL_SIZE);
+
+    for (let i = 0; i < SPLASH_POOL_SIZE; i++) {
+      this._splashPositions[i * 3 + 1] = -100.0;
+    }
+
+    const posAttr = new THREE.BufferAttribute(this._splashPositions, 3);
+    posAttr.setUsage(THREE.DynamicDrawUsage);
+    const sizeAttr = new THREE.BufferAttribute(this._splashSizes, 1);
+    sizeAttr.setUsage(THREE.DynamicDrawUsage);
+    const alphaAttr = new THREE.BufferAttribute(this._splashAlphas, 1);
+    alphaAttr.setUsage(THREE.DynamicDrawUsage);
+
+    this._splashGeometry = new THREE.BufferGeometry();
+    this._splashGeometry.setAttribute('position', posAttr);
+    this._splashGeometry.setAttribute('aSize', sizeAttr);
+    this._splashGeometry.setAttribute('aAlpha', alphaAttr);
+
+    this._splashMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        uSunColor: this.uniforms.uSunColor,
+        uSkyHorizonColor: this.uniforms.uSkyHorizonColor,
+        uSunIntensity: this.uniforms.uSunIntensity,
+        uFogColor: this.uniforms.uFogColor,
+        uFogDensity: this.uniforms.uFogDensity,
+      },
+      transparent: true,
+      depthWrite: false,
+      depthTest: true,
+      blending: THREE.NormalBlending,
+      vertexShader: /* glsl */ `
+        attribute float aSize;
+        attribute float aAlpha;
+
+        varying float vAlpha;
+        varying float vDist;
+
+        void main() {
+          vAlpha = aAlpha;
+          vec4 worldPos = modelMatrix * vec4( position, 1.0 );
+          vec4 mvPosition = viewMatrix * worldPos;
+          vDist = length( cameraPosition - worldPos.xyz );
+          gl_Position = projectionMatrix * mvPosition;
+
+          if ( aAlpha <= 0.002 ) {
+            gl_PointSize = 0.0;
+          } else {
+            gl_PointSize = clamp( aSize * ( 290.0 / max( -mvPosition.z, 0.5 ) ), 1.5, 42.0 );
+          }
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        uniform vec3 uSunColor;
+        uniform vec3 uSkyHorizonColor;
+        uniform float uSunIntensity;
+        uniform vec3 uFogColor;
+        uniform float uFogDensity;
+
+        varying float vAlpha;
+        varying float vDist;
+
+        void main() {
+          if ( vAlpha <= 0.002 ) {
+            discard;
+          }
+
+          vec2 p = gl_PointCoord * 2.0 - 1.0;
+          float r2 = dot( p, p );
+          if ( r2 > 1.0 ) {
+            discard;
+          }
+
+          float r = sqrt( r2 );
+          float softBody = pow( max( 1.0 - r, 0.0 ), 1.45 );
+          vec2 glintDelta = p - vec2( -0.25, -0.25 );
+          float glint = exp( -dot( glintDelta, glintDelta ) * 11.5 );
+
+          vec3 aquaCore = mix(
+            vec3( 0.72, 0.91, 0.94 ),
+            vec3( 0.97, 0.995, 1.0 ),
+            clamp( softBody * 0.65 + glint * 0.65, 0.0, 1.0 )
+          );
+          vec3 envLit = max(
+            uSkyHorizonColor * 0.52 + uSunColor * ( 0.20 + uSunIntensity * 0.72 ),
+            vec3( 0.18, 0.25, 0.30 )
+          );
+          vec3 col = aquaCore * envLit + uSunColor * glint * ( 0.22 + uSunIntensity * 0.62 );
+
+          float fogFactor = 1.0 - exp( -uFogDensity * uFogDensity * vDist * vDist );
+          col = mix( col, uFogColor, clamp( fogFactor, 0.0, 1.0 ) );
+
+          float alpha = clamp( ( softBody * 0.84 + glint * 0.42 ) * vAlpha, 0.0, 0.95 );
+          gl_FragColor = vec4( col, alpha );
+
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+    });
+
+    const points = new THREE.Points(this._splashGeometry, this._splashMaterial);
+    points.name = 'StreamSplashDroplets';
+    points.frustumCulled = false;
+    points.renderOrder = 3;
+    return points;
+  }
+
+  /**
+   * Spawns an expanding concentric surface impact ripple in uImpactRipples
+   * and emits a glistening upward/outward splash droplet burst from the pool.
+   */
+  spawnImpact(worldPos, strength = 1.0) {
+    if (!worldPos) return;
+
+    const s = clamp(Number.isFinite(strength) ? strength : 1.0, 0.1, 2.5);
+    const waterY = this.uniforms.uWaterLevel.value;
+    const wx = worldPos.x;
+    const wz = worldPos.z;
+
+    // 1. Ring-buffer record expanding ripple (x, z, startTime, strength)
+    const slot = this.uniforms.uImpactRipples.value[this._impactRippleCursor];
+    slot.set(wx, wz, this.uniforms.uTime.value, s);
+    this._impactRippleCursor = (this._impactRippleCursor + 1) % MAX_IMPACT_RIPPLES;
+
+    // 2. Emit 14–36 sparkling upward/outward splash droplets scaled by impact strength
+    const strNorm = clamp((s - 0.35) / 1.45, 0.0, 1.0);
+    const emitCount = Math.round(lerp(14, 36, strNorm));
+
+    for (let k = 0; k < emitCount; k++) {
+      const idx = this._splashCursor;
+      this._splashCursor = (this._splashCursor + 1) % SPLASH_POOL_SIZE;
+
+      const angle = Math.random() * Math.PI * 2.0;
+      const cosA = Math.cos(angle);
+      const sinA = Math.sin(angle);
+      const spawnRad = (0.04 + Math.random() * 0.24) * (0.65 + s * 0.35);
+
+      const isFineMist = Math.random() < 0.35;
+      const horizSpeed = (0.75 + Math.random() * 1.95) * (0.65 + s * 0.45) * (isFineMist ? 1.15 : 0.9);
+      const vertSpeed = (2.1 + Math.random() * 3.1) * (0.65 + s * 0.42) * (isFineMist ? 1.12 : 0.95);
+
+      const p3 = idx * 3;
+      this._splashPositions[p3] = wx + cosA * spawnRad;
+      this._splashPositions[p3 + 1] = waterY + 0.03 + Math.random() * 0.08;
+      this._splashPositions[p3 + 2] = wz + sinA * spawnRad;
+
+      this._splashVelocities[p3] = cosA * horizSpeed;
+      this._splashVelocities[p3 + 1] = vertSpeed;
+      this._splashVelocities[p3 + 2] = sinA * horizSpeed;
+
+      this._splashSizes[idx] = (isFineMist ? 0.048 : 0.085) + Math.random() * 0.095 * (0.75 + s * 0.25);
+      this._splashAlphas[idx] = isFineMist ? 0.72 + Math.random() * 0.2 : 0.86 + Math.random() * 0.14;
+      this._splashAges[idx] = 0.0;
+      this._splashLifetimes[idx] = 0.42 + Math.random() * 0.48;
+      this._splashActive[idx] = 1;
+    }
+
+    this._splashDirty = true;
+    this._activeSplashCount = Math.min(SPLASH_POOL_SIZE, this._activeSplashCount + emitCount);
+    this._splashGeometry.attributes.position.needsUpdate = true;
+    this._splashGeometry.attributes.aSize.needsUpdate = true;
+    this._splashGeometry.attributes.aAlpha.needsUpdate = true;
+  }
+
+  _updateSplashParticles(dt) {
+    if (!this._splashDirty && this._activeSplashCount === 0) return;
+
+    const waterY = this.uniforms.uWaterLevel.value;
+    const horizDrag = dt > 0 ? Math.exp(-dt * 1.6) : 1.0;
+    let activeCount = 0;
+
+    for (let i = 0; i < SPLASH_POOL_SIZE; i++) {
+      if (!this._splashActive[i]) continue;
+
+      const age = this._splashAges[i] + dt;
+      const lifetime = this._splashLifetimes[i];
+      const p3 = i * 3;
+
+      let vx = this._splashVelocities[p3] * horizDrag;
+      let vy = this._splashVelocities[p3 + 1] + SPLASH_GRAVITY * dt;
+      let vz = this._splashVelocities[p3 + 2] * horizDrag;
+
+      const px = this._splashPositions[p3] + vx * dt;
+      const py = this._splashPositions[p3 + 1] + vy * dt;
+      const pz = this._splashPositions[p3 + 2] + vz * dt;
+
+      this._splashVelocities[p3] = vx;
+      this._splashVelocities[p3 + 1] = vy;
+      this._splashVelocities[p3 + 2] = vz;
+
+      const lifeT = clamp(age / Math.max(lifetime, 0.001), 0.0, 1.0);
+      const lifeFade = 1.0 - lifeT;
+
+      // Fade alpha smoothly as droplets plunge back into the stream surface
+      let splashdownFade = 1.0;
+      if (vy < 0.0 && py < waterY + 0.08) {
+        splashdownFade = clamp((py - (waterY - 0.05)) / 0.13, 0.0, 1.0);
+      }
+
+      const alpha = lifeFade * lifeFade * splashdownFade * 0.92;
+
+      if (age >= lifetime || (vy < 0.0 && py <= waterY - 0.05) || alpha <= 0.005) {
+        this._splashActive[i] = 0;
+        this._splashAlphas[i] = 0.0;
+        this._splashPositions[p3 + 1] = -100.0;
+      } else {
+        this._splashAges[i] = age;
+        this._splashPositions[p3] = px;
+        this._splashPositions[p3 + 1] = py;
+        this._splashPositions[p3 + 2] = pz;
+        this._splashAlphas[i] = alpha;
+        activeCount++;
+      }
+    }
+
+    this._activeSplashCount = activeCount;
+    this._splashDirty = activeCount > 0;
+    this._splashGeometry.attributes.position.needsUpdate = true;
+    this._splashGeometry.attributes.aSize.needsUpdate = true;
+    this._splashGeometry.attributes.aAlpha.needsUpdate = true;
+  }
+
   update(
     elapsed,
     {
@@ -517,7 +816,11 @@ export class StreamWater {
       windSpeed,
     } = {}
   ) {
-    this.uniforms.uTime.value = elapsed;
+    const safeElapsed = Number.isFinite(elapsed) ? elapsed : 0.0;
+    const dt = clamp(safeElapsed - this._lastElapsed, 0.0, 0.05);
+    this._lastElapsed = safeElapsed;
+
+    this.uniforms.uTime.value = safeElapsed;
 
     if (sunDir) {
       this.uniforms.uSunDir.value.copy(sunDir).normalize();
@@ -553,9 +856,20 @@ export class StreamWater {
     if (this.windSystem?.uniforms?.uWindDir) {
       this.uniforms.uWindDir.value.copy(this.windSystem.uniforms.uWindDir.value);
     }
+
+    this._updateSplashParticles(dt);
   }
 
   dispose() {
+    if (this.splashPoints) {
+      this.mesh.remove(this.splashPoints);
+    }
+    if (this._splashGeometry) {
+      this._splashGeometry.dispose();
+    }
+    if (this._splashMaterial) {
+      this._splashMaterial.dispose();
+    }
     this.geometry.dispose();
     this.material.dispose();
   }

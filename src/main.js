@@ -12,6 +12,8 @@ import { Undergrowth } from './vegetation/Undergrowth.js';
 import { ControlsAndRaycast } from './interaction/ControlsAndRaycast.js';
 import { ProceduralAudio } from './audio/ProceduralAudio.js';
 import { ControlPanel } from './ui/ControlPanel.js';
+import { HumanController } from './character/HumanController.js';
+import { ForestWildlife } from './wildlife/ForestWildlife.js';
 
 const WEATHER_PRESETS = {
   Clear: { rain: 0.0, wetness: 0.0, windMult: 1.0, gustMult: 1.0 },
@@ -61,6 +63,12 @@ async function bootstrapForest() {
   const crosshair = document.getElementById('crosshair');
   const promptEl = document.getElementById('interaction-prompt');
   const promptText = document.getElementById('prompt-text');
+  const staminaContainer = document.getElementById('stamina-container');
+  const staminaFill = document.getElementById('stamina-fill');
+  const staminaLabel = document.getElementById('stamina-label');
+  const staminaPct = document.getElementById('stamina-pct');
+  const reactionBadge = document.getElementById('reaction-badge');
+  const reactionText = document.getElementById('reaction-text');
   const audioToggleBtn = document.getElementById('audio-toggle');
   const audioLabel = document.getElementById('audio-label');
   const iconAudioOff = document.getElementById('icon-audio-off');
@@ -85,7 +93,10 @@ async function bootstrapForest() {
     windSpeed: 1.0,
     windDirection: 25,
     gustTurbulence: 0.55,
-    cameraMode: 'Orbit',
+    cameraMode: 'Third-Person',
+    sprintSpeed: 1.0,
+    infiniteStamina: false,
+    wildlifePopulation: 1.0,
     quality: 'High',
   };
 
@@ -97,7 +108,7 @@ async function bootstrapForest() {
     gustMult: 1.0,
   };
 
-  setProgress(15, 'Initializing WebGL renderer & wind field…');
+  setProgress(12, 'Initializing WebGL renderer & wind field…');
   await nextPaint();
 
   const engine = new Engine(viewport);
@@ -107,7 +118,7 @@ async function bootstrapForest() {
     gustTurbulence: simState.gustTurbulence,
   });
 
-  setProgress(32, 'Sculpting terrain, stream valley & ground shaders…');
+  setProgress(26, 'Sculpting terrain, stream valley & ground shaders…');
   await nextPaint();
 
   const terrain = new Terrain(4242);
@@ -118,25 +129,28 @@ async function bootstrapForest() {
 
   const skyLighting = new SkyLighting(engine.scene, engine.renderer, terrain);
 
-  setProgress(54, 'Growing pines, oaks & silver birches…');
+  setProgress(46, 'Growing pines, oaks & silver birches…');
   await nextPaint();
 
   const treeFactory = new TreeFactory(engine.scene, terrain, windSystem);
 
-  setProgress(74, 'Scattering grass meadow, ferns, boulders & mushrooms…');
+  setProgress(64, 'Scattering grass meadow, ferns, boulders & mushrooms…');
   await nextPaint();
 
   const undergrowth = new Undergrowth(engine.scene, terrain, windSystem, treeFactory.treePositions);
   const particles = new Particles(engine.scene, terrain, windSystem);
   const audio = new ProceduralAudio({ volume: parseFloat(audioVolumeSlider?.value || '0.72') });
 
-  setProgress(90, 'Lighting campfire, flock & soundscape…');
+  setProgress(80, 'Rigging human explorer, Foot IK & forest wildlife…');
   await nextPaint();
 
   // HUD synchronization helpers
   let isPointerLocked = false;
   let lastClockText = '';
   let lastPhaseText = '';
+  let controlPanel = null;
+  let wildlife = null;
+  let human = null;
 
   const updateAudioUI = () => {
     const muted = audio.isMuted();
@@ -149,44 +163,70 @@ async function bootstrapForest() {
     if (iconAudioOn) iconAudioOn.classList.toggle('hidden', muted);
   };
 
-  const updateCameraUI = (mode) => {
-    simState.cameraMode = mode;
-    if (hudCamera) hudCamera.textContent = mode;
-    if (cameraBtnLabel) {
-      cameraBtnLabel.textContent = mode === 'Orbit' ? 'First-Person' : 'Orbit View';
-    }
-    viewport.classList.toggle('fp-mode', mode === 'First-Person');
-    if (crosshair) {
-      crosshair.classList.toggle('visible', mode === 'First-Person' && isPointerLocked);
-      if (mode !== 'First-Person') crosshair.classList.remove('interactive');
-    }
-    controlPanel?.sync();
-  };
-
   const updatePromptUI = (text, isInteractive) => {
     if (promptText && text) promptText.textContent = text;
     if (promptEl) promptEl.classList.toggle('highlight', Boolean(isInteractive));
-    viewport.classList.toggle('interactive-hover', Boolean(isInteractive) && simState.cameraMode === 'Orbit');
+    viewport.classList.toggle(
+      'interactive-hover',
+      Boolean(isInteractive) && simState.cameraMode !== 'First-Person Body'
+    );
     if (crosshair) {
-      crosshair.classList.toggle('interactive', Boolean(isInteractive) && simState.cameraMode === 'First-Person');
+      crosshair.classList.toggle(
+        'interactive',
+        Boolean(isInteractive) && simState.cameraMode === 'First-Person Body'
+      );
     }
   };
 
   const controls = new ControlsAndRaycast(engine, terrain, windSystem, audio, {
-    onCameraModeChange: (mode) => updateCameraUI(mode),
     onPromptChange: (text, isInteractive) => updatePromptUI(text, isInteractive),
+  });
+
+  const syncCameraModeUI = (mode) => {
+    simState.cameraMode = mode;
+    if (hudCamera) hudCamera.textContent = mode;
+    if (cameraBtnLabel) cameraBtnLabel.textContent = mode;
+    viewport.classList.toggle('fp-mode', mode === 'First-Person Body');
+    if (crosshair) {
+      crosshair.classList.toggle('visible', mode === 'First-Person Body' && isPointerLocked);
+      if (mode !== 'First-Person Body') crosshair.classList.remove('interactive');
+    }
+
+    if (mode === 'Free Orbit' && human) {
+      const hp = human.getPosition(new THREE.Vector3());
+      controls.orbitControls.target.set(hp.x, hp.y + 1.25, hp.z);
+      const camX = hp.x + 6.2;
+      const camZ = hp.z + 5.6;
+      const camY = Math.max(terrain.getHeightAt(camX, camZ) + 2.4, hp.y + 3.4);
+      engine.camera.position.set(camX, camY, camZ);
+      controls.orbitControls.update();
+    }
+
+    controls.setExternalMode(mode, { pointerLocked: isPointerLocked });
+    controlPanel?.sync();
+  };
+
+  human = new HumanController(engine, terrain, windSystem, streamWater, audio, {
+    onCameraModeChange: (mode) => syncCameraModeUI(mode),
     onPointerLockChange: (locked) => {
       isPointerLocked = locked;
+      controls.setExternalPointerLocked(locked);
       if (crosshair) {
-        crosshair.classList.toggle('visible', simState.cameraMode === 'First-Person' && locked);
+        crosshair.classList.toggle('visible', simState.cameraMode === 'First-Person Body' && locked);
       }
     },
-    onCampfireToggle: () => {
-      // Prompt updates immediately on next raycast tick
+    onTriggerRatScare: () => {
+      wildlife?.triggerRatScare(human);
     },
-    onBirdsStartled: () => {
-      // Audio trigger handled inside ControlsAndRaycast
-    },
+    isHoveringInteractive: () => controls.isHoveringInteractive(),
+  });
+
+  wildlife = new ForestWildlife(engine.scene, terrain, treeFactory.treePositions, audio);
+
+  // Connect Rain lightning thunderclaps to rolling thunder audio & human startle flinch
+  skyLighting.setThunderCallback((intensity) => {
+    audio.playThunder(intensity);
+    human.triggerThunderFlinch();
   });
 
   const syncColliders = () => {
@@ -195,6 +235,7 @@ async function bootstrapForest() {
       ...undergrowth.getActiveColliders(),
     ];
     controls.setColliders(combined);
+    human.setColliders(combined);
   };
 
   const applyQualityPreset = (preset) => {
@@ -225,11 +266,29 @@ async function bootstrapForest() {
       gustMult: weatherState.gustMult,
       wetness: weatherState.wetness,
     });
+    human.setRainWetness(weatherState.wetness);
     if (hudWeather) hudWeather.textContent = weather;
     controlPanel?.sync();
   };
 
-  const controlPanel = new ControlPanel(simState, {
+  controlPanel = new ControlPanel(simState, {
+    onCameraModeChange: (mode) => human.setCameraMode(mode),
+    onCharacterChange: () => {
+      human.setSprintMultiplier(simState.sprintSpeed);
+      human.setInfiniteStamina(simState.infiniteStamina);
+    },
+    onWildlifeChange: (pop) => {
+      wildlife.setPopulation(pop);
+    },
+    onTriggerRatScare: () => {
+      wildlife.triggerRatScare(human);
+    },
+    onTriggerStreamSlip: () => {
+      human.triggerStreamSlip();
+    },
+    onTriggerLightning: () => {
+      skyLighting.triggerLightning(true);
+    },
     onTimeChange: () => {
       if (hudClock) hudClock.textContent = formatClock(simState.timeOfDay);
       if (hudPhase) hudPhase.textContent = getDayPhaseLabel(simState.timeOfDay);
@@ -239,20 +298,24 @@ async function bootstrapForest() {
     },
     onWindChange: () => applyWindParams(),
     onAtmosphereChange: () => {},
-    onCameraModeChange: (mode) => controls.setCameraMode(mode),
     onQualityChange: (preset) => applyQualityPreset(preset),
     onToggleCampfire: () => controls.toggleCampfire(),
     onStartleBirds: () => controls.startleBirds(),
-    onResetCamera: () => controls.resetCamera(),
+    onResetCamera: () => {
+      human.resetPositionAndCamera();
+      if (simState.cameraMode === 'Free Orbit') {
+        controls.resetCamera();
+      }
+    },
   });
 
   engine.attachStats(controlPanel.stats);
   applyQualityPreset(simState.quality);
   applyWindParams();
   updateAudioUI();
-  updateCameraUI(simState.cameraMode);
+  syncCameraModeUI(simState.cameraMode);
 
-  // Wire HUD dock controls
+  // Wire HUD dock buttons
   if (audioToggleBtn) {
     audioToggleBtn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -277,22 +340,21 @@ async function bootstrapForest() {
   if (cameraToggleBtn) {
     cameraToggleBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const nextMode = simState.cameraMode === 'Orbit' ? 'First-Person' : 'Orbit';
-      controls.setCameraMode(nextMode);
+      human.cycleCameraMode();
     });
   }
 
-  // Reusable scratch vector for update loop (zero per-frame allocations)
+  // Reusable scratch vector
   const playerPos = new THREE.Vector3();
 
-  // Fixed-step loop for boid flock steering
+  // Fixed-step update for 3D boid bird flock
   engine.onFixedUpdate((fixedDt, elapsed) => {
     controls.updateFixed(fixedDt, elapsed);
   });
 
   // Main per-frame simulation loop
   engine.onUpdate((dt, elapsed) => {
-    // 1. Advance 24h cycle when enabled
+    // 1. Advance 24h cycle
     if (simState.autoCycle && simState.cycleSpeed > 0) {
       simState.timeOfDay = (simState.timeOfDay + dt * simState.cycleSpeed * 0.45) % 24;
     }
@@ -311,12 +373,19 @@ async function bootstrapForest() {
       wetness: weatherState.wetness,
     });
     windSystem.update(dt, elapsed);
+    human.setRainWetness(weatherState.wetness);
 
-    // 3. Update camera, raycasting, campfire & birds
+    // 3. Update playable human character, Foot IK, dust & camera
+    human.update(dt, elapsed);
+    human.getPosition(playerPos);
+
+    // 4. Update forest wildlife (rats, leg-climbing scares, tree squirrels & meadow rabbits)
+    wildlife.update(dt, elapsed, human);
+
+    // 5. Update interactive campfire, birds, and Free Orbit/click raycasting
     controls.update(dt, elapsed);
-    controls.getPlayerPosition(playerPos);
 
-    // 4. Update 24h sky, directional sun/moon, fog, and volumetric sunbeams
+    // 6. Update 24h sky, directional sun/moon, lightning flashes, fog & volumetric sunbeams
     const sky = skyLighting.update(dt, elapsed, {
       timeOfDay: simState.timeOfDay,
       weather: simState.weather,
@@ -328,7 +397,7 @@ async function bootstrapForest() {
     engine.setExposure(sky.recommendedExposure);
     engine.setBloomConfig({ strength: sky.recommendedBloomStrength });
 
-    // 5. Update terrain & meandering stream water shaders
+    // 7. Update terrain & meandering stream water (with splash physics & impact ripples)
     terrain.update(elapsed, {
       sunDir: sky.sunDir,
       sunIntensity: sky.sunIntensity,
@@ -347,7 +416,7 @@ async function bootstrapForest() {
       windSpeed: windSystem.uniforms.uWindSpeed.value,
     });
 
-    // 6. Update bioluminescent mushrooms, mossy boulder wetness, and atmospheric particles
+    // 8. Update bioluminescent mushrooms, mossy boulder wetness, and atmospheric particles
     undergrowth.update(dt, elapsed, {
       nightFactor: sky.nightFactor,
       wetness: weatherState.wetness,
@@ -362,10 +431,11 @@ async function bootstrapForest() {
       windSpeed: windSystem.uniforms.uWindSpeed.value,
     });
 
-    // 7. Update real-time procedural Web Audio soundscape
-    const localGust = windSystem.sampleGustAt(playerPos.x, playerPos.z);
-    const streamDistance = terrain.getStreamDistance(playerPos.x, playerPos.z);
-    const campfireDistance = playerPos.distanceTo(controls.campfirePos);
+    // 9. Update real-time procedural Web Audio soundscape around explorer position
+    const listenerPos = simState.cameraMode === 'Free Orbit' ? engine.camera.position : playerPos;
+    const localGust = windSystem.sampleGustAt(listenerPos.x, listenerPos.z);
+    const streamDistance = terrain.getStreamDistance(listenerPos.x, listenerPos.z);
+    const campfireDistance = listenerPos.distanceTo(controls.campfirePos);
 
     audio.update(dt, elapsed, {
       gustIntensity: localGust.intensity,
@@ -378,7 +448,56 @@ async function bootstrapForest() {
       rainIntensity: weatherState.rainIntensity,
     });
 
-    // 8. Refresh compact HUD clock & phase text only when changed
+    // 10. Update auto-hiding HUD Stamina bar & reaction alerts
+    const stamina = human.getStamina();
+    const exhausted = human.isExhausted();
+    const showStamina = !simState.infiniteStamina && (stamina < 99.4 || exhausted);
+    if (staminaContainer) {
+      staminaContainer.classList.toggle('hidden-fade', !showStamina);
+      staminaContainer.classList.toggle('exhausted', exhausted);
+    }
+    if (staminaFill) {
+      staminaFill.style.width = `${Math.round(stamina)}%`;
+      staminaFill.classList.toggle('low', !exhausted && stamina < 35);
+      staminaFill.classList.toggle('exhausted', exhausted);
+    }
+    if (staminaLabel) {
+      staminaLabel.textContent = exhausted ? 'Winded — Recovering' : 'Stamina';
+    }
+    if (staminaPct) {
+      staminaPct.textContent = `${Math.round(stamina)}%`;
+    }
+
+    // Reaction Alert Badge
+    const stateName = human.getStateName();
+    const panicInfo = human.getPanicInfo();
+    let badgeMsg = '';
+    let isCalmStyle = false;
+    if (panicInfo.active) {
+      if (panicInfo.stage === 1) {
+        badgeMsg = 'RAT ON BOOT! Electro-Shock Flinch!';
+      } else if (panicInfo.stage === 2) {
+        badgeMsg = 'RAT CLIMBING LEG! Shaking furiously — Hold Shift+WASD to flee!';
+      } else if (panicInfo.stage === 3) {
+        badgeMsg = 'Shivering… Checking grass around boots';
+        isCalmStyle = true;
+      }
+    } else if (stateName === 'SlipRecovery') {
+      badgeMsg = 'Slipping on wet stream rocks!';
+    } else if (stateName === 'ThunderFlinch') {
+      badgeMsg = 'Startled by thunderclap!';
+      isCalmStyle = true;
+    }
+
+    if (reactionBadge) {
+      reactionBadge.classList.toggle('hidden-fade', !badgeMsg);
+      reactionBadge.classList.toggle('calm', isCalmStyle);
+    }
+    if (reactionText && badgeMsg) {
+      reactionText.textContent = badgeMsg;
+    }
+
+    // 11. Refresh HUD clock & phase text when changed
     const clockStr = formatClock(simState.timeOfDay);
     if (clockStr !== lastClockText) {
       lastClockText = clockStr;
@@ -403,6 +522,8 @@ async function bootstrapForest() {
     undergrowth,
     particles,
     controls,
+    human,
+    wildlife,
     audio,
     controlPanel,
     setTimeOfDay(hours) {
@@ -424,7 +545,16 @@ async function bootstrapForest() {
       controlPanel.sync();
     },
     setCameraMode(mode) {
-      controls.setCameraMode(mode);
+      human.setCameraMode(mode);
+    },
+    triggerRatScare() {
+      return wildlife.triggerRatScare(human);
+    },
+    triggerStreamSlip() {
+      human.triggerStreamSlip();
+    },
+    triggerLightning(immediateThunder = true) {
+      skyLighting.triggerLightning(immediateThunder);
     },
     toggleCampfire(forceState) {
       return controls.toggleCampfire(forceState);
@@ -438,6 +568,7 @@ async function bootstrapForest() {
     },
     getSceneStats() {
       const info = engine.renderer.info;
+      const hp = human.getPosition(new THREE.Vector3());
       return {
         drawCalls: info.render.calls,
         triangles: info.render.triangles,
@@ -446,20 +577,23 @@ async function bootstrapForest() {
         textures: info.memory.textures,
         campfireLit: controls.isCampfireLit(),
         birdsFlying: controls.areBirdsFlying(),
-        cameraMode: controls.getCameraMode(),
+        cameraMode: human.getCameraMode(),
+        humanState: human.getStateName(),
+        humanPos: { x: Number(hp.x.toFixed(2)), y: Number(hp.y.toFixed(2)), z: Number(hp.z.toFixed(2)) },
+        stamina: Number(human.getStamina().toFixed(1)),
+        exhausted: human.isExhausted(),
+        panic: human.getPanicInfo(),
+        wildlife: wildlife.getStats(),
         timeOfDay: simState.timeOfDay,
         weather: simState.weather,
         quality: simState.quality,
-        treeColliders: treeFactory.getActiveColliders().length,
-        undergrowthColliders: undergrowth.getActiveColliders().length,
       };
     },
   };
 
-  setProgress(100, 'Compiling forest shaders…');
+  setProgress(100, 'Compiling forest & character shaders…');
   engine.start();
 
-  // Warm up one frame so shader compilation finishes before fading loading veil
   await nextPaint();
   await nextPaint();
 

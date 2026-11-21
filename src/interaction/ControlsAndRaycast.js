@@ -1801,6 +1801,31 @@ export class ControlsAndRaycast {
     return false;
   }
 
+  /**
+   * Cooperates with HumanController's 3-mode camera system ('Third-Person', 'First-Person Body', 'Free Orbit')
+   * while keeping campfire/bird raycasting, boids, and Free OrbitControls seamlessly active.
+   */
+  setExternalMode(mode, { pointerLocked = false } = {}) {
+    this._externalMode = mode;
+    this._externalPointerLocked = Boolean(pointerLocked);
+    const orbitActive = mode === 'Free Orbit';
+    this.orbitControls.enabled = orbitActive;
+    this.pointerLockControls.enabled = false;
+    this._updatePrompt();
+  }
+
+  setExternalPointerLocked(locked) {
+    this._externalPointerLocked = Boolean(locked);
+    this._updatePrompt();
+  }
+
+  isHoveringInteractive() {
+    return Boolean(
+      this._hoveredTarget === 'campfire' ||
+        (this._hoveredTarget === 'birds' && this._flockState === 'perched')
+    );
+  }
+
   _updatePrompt() {
     let text = '';
     let isInteractive = false;
@@ -1811,15 +1836,23 @@ export class ControlsAndRaycast {
     } else if (this._hoveredTarget === 'birds' && this._flockState === 'perched') {
       text = 'Click to startle forest birds';
       isInteractive = true;
+    } else if (this._externalMode === 'Third-Person') {
+      text = 'Drag to orbit • Click campfire or birds';
+    } else if (this._externalMode === 'First-Person Body') {
+      text = this._externalPointerLocked
+        ? 'Look down to see body • Click campfire or birds • ESC release'
+        : 'Click scene to lock look • Click campfire or birds';
+    } else if (this._externalMode === 'Free Orbit') {
+      text = 'Free Orbit • Drag to rotate • Scroll zoom';
     } else if (this._cameraMode === 'Orbit') {
-      text = 'Drag to orbit • Scroll to zoom • Click campfire or birds • Press C for First-Person';
+      text = 'Drag to orbit • Scroll to zoom • Click campfire or birds • Press V for camera';
     } else if (this._isPointerLocked || this.pointerLockControls.isLocked) {
-      text = 'WASD to walk • Shift to sprint • Click campfire or birds • ESC to unlock • C for Orbit';
+      text = 'WASD to walk • Shift to sprint • Click campfire or birds • ESC to unlock';
     } else {
-      text = 'Click scene to look around • WASD to walk • Shift to sprint • Press C for Orbit';
+      text = 'Click scene to look around • WASD to walk • Shift to sprint';
     }
 
-    if (this._cameraMode === 'Orbit') {
+    if (this._externalMode === 'Free Orbit' || this._externalMode === 'Third-Person' || (!this._externalMode && this._cameraMode === 'Orbit')) {
       this.engine.container.classList.toggle('interactive-hover', isInteractive);
     } else {
       this.engine.container.classList.remove('interactive-hover');
@@ -1859,7 +1892,7 @@ export class ControlsAndRaycast {
     this._onPointerLeave = () => {
       this._pointerInside = false;
       this._isPointerDown = false;
-      if (this._cameraMode === 'Orbit') {
+      if (this._externalMode === 'Free Orbit' || (!this._externalMode && this._cameraMode === 'Orbit')) {
         this.windSystem?.setInteractorTarget?.(null, false);
         this._hoveredTarget = null;
         this._updatePrompt();
@@ -1873,8 +1906,15 @@ export class ControlsAndRaycast {
       this._pointerDownPos.x = e.clientX;
       this._pointerDownPos.y = e.clientY;
 
-      // In First-Person mode: if already locked, interact directly via center-screen raycast;
-      // otherwise lock the pointer on canvas click.
+      if (this._externalMode) {
+        if (this._externalMode === 'First-Person Body' && this._externalPointerLocked) {
+          const hitTag = this._pickInteractive(_centerNdc);
+          if (hitTag) this._triggerInteraction(hitTag);
+        }
+        return;
+      }
+
+      // Standalone First-Person mode fallback
       if (this._cameraMode === 'First-Person') {
         if (this.pointerLockControls.isLocked || this._isPointerLocked) {
           const hitTag = this._pickInteractive(_centerNdc);
@@ -1891,7 +1931,11 @@ export class ControlsAndRaycast {
       if (e.button !== 0 || !this._isPointerDown) return;
       this._isPointerDown = false;
 
-      if (this._cameraMode === 'Orbit') {
+      const allowClickPick = this._externalMode
+        ? this._externalMode !== 'First-Person Body' || !this._externalPointerLocked
+        : this._cameraMode === 'Orbit';
+
+      if (allowClickPick) {
         const dx = e.clientX - this._pointerDownPos.x;
         const dy = e.clientY - this._pointerDownPos.y;
         if (dx * dx + dy * dy <= 36) {
@@ -1909,6 +1953,7 @@ export class ControlsAndRaycast {
     };
 
     this._onKeyDown = (e) => {
+      if (this._externalMode) return;
       const active = document.activeElement;
       const target = e.target;
       const isTextField = (el) =>
@@ -1941,17 +1986,13 @@ export class ControlsAndRaycast {
         case 'ShiftRight':
           this._keys.sprint = true;
           break;
-        case 'KeyC':
-          if (!e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey) {
-            this.setCameraMode(this._cameraMode === 'Orbit' ? 'First-Person' : 'Orbit');
-          }
-          break;
         default:
           break;
       }
     };
 
     this._onKeyUp = (e) => {
+      if (this._externalMode) return;
       switch (e.code) {
         case 'KeyW':
         case 'ArrowUp':
@@ -2003,10 +2044,46 @@ export class ControlsAndRaycast {
   update(dt, elapsed) {
     const safeDt = clamp(dt || 0.016, 0.0005, 0.05);
 
-    if (this._cameraMode === 'Orbit') {
+    if (this._externalMode) {
+      if (this._externalMode === 'Free Orbit') {
+        this.orbitControls.update();
+
+        const tgt = this.orbitControls.target;
+        tgt.x = clamp(tgt.x, -ORBIT_TARGET_BOUND, ORBIT_TARGET_BOUND);
+        tgt.z = clamp(tgt.z, -ORBIT_TARGET_BOUND, ORBIT_TARGET_BOUND);
+        const tgtGround = this.terrain.getHeightAt(tgt.x, tgt.z);
+        tgt.y = clamp(tgt.y, Math.max(tgtGround + 0.2, WATER_LEVEL + 0.2), 38);
+
+        const camPos = this.camera.position;
+        camPos.x = clamp(camPos.x, -MAP_BOUND - 6, MAP_BOUND + 6);
+        camPos.z = clamp(camPos.z, -MAP_BOUND - 6, MAP_BOUND + 6);
+        const camGround = this.terrain.getHeightAt(camPos.x, camPos.z);
+        camPos.y = Math.max(camPos.y, camGround + 1.15);
+
+        if (this._pointerInside) {
+          this._hoveredTarget = this._pickInteractive(this._pointerNdc);
+          this._updatePrompt();
+
+          if (elapsed - this._lastTerrainRayTime > 0.022) {
+            this._lastTerrainRayTime = elapsed;
+            this._raycaster.setFromCamera(this._pointerNdc, this.camera);
+            if (this._raycastTerrainHeightfield(this._raycaster.ray, this._terrainHitPoint)) {
+              this.windSystem?.setInteractorTarget?.(this._terrainHitPoint, true);
+            } else {
+              this.windSystem?.setInteractorTarget?.(null, false);
+            }
+          }
+        }
+      } else if (this._externalMode === 'First-Person Body' && this._externalPointerLocked) {
+        this._hoveredTarget = this._pickInteractive(_centerNdc);
+        this._updatePrompt();
+      } else if (this._pointerInside) {
+        this._hoveredTarget = this._pickInteractive(this._pointerNdc);
+        this._updatePrompt();
+      }
+    } else if (this._cameraMode === 'Orbit') {
       this.orbitControls.update();
 
-      // Clamp orbit target inside [-95, 95] and keep camera safely above terrain
       const tgt = this.orbitControls.target;
       tgt.x = clamp(tgt.x, -ORBIT_TARGET_BOUND, ORBIT_TARGET_BOUND);
       tgt.z = clamp(tgt.z, -ORBIT_TARGET_BOUND, ORBIT_TARGET_BOUND);
@@ -2019,12 +2096,10 @@ export class ControlsAndRaycast {
       const camGround = this.terrain.getHeightAt(camPos.x, camPos.z);
       camPos.y = Math.max(camPos.y, camGround + 1.15);
 
-      // Raycast pointer onto terrain & interactive targets in Orbit mode
       if (this._pointerInside) {
         this._hoveredTarget = this._pickInteractive(this._pointerNdc);
         this._updatePrompt();
 
-        // Update foliage parting interactor on terrain surface (throttled ~45 Hz for efficiency)
         if (elapsed - this._lastTerrainRayTime > 0.022) {
           this._lastTerrainRayTime = elapsed;
           this._raycaster.setFromCamera(this._pointerNdc, this.camera);
@@ -2036,7 +2111,7 @@ export class ControlsAndRaycast {
         }
       }
     } else {
-      // First-Person Explorer smooth horizontal WASD/Arrows movement + SpatialHash2D collision
+      // Standalone First-Person fallback
       this.camera.getWorldDirection(_v1);
       _v1.y = 0;
       if (_v1.lengthSq() < 1e-5) {
@@ -2044,7 +2119,7 @@ export class ControlsAndRaycast {
       } else {
         _v1.normalize();
       }
-      _v2.crossVectors(_v1, _up).normalize(); // right
+      _v2.crossVectors(_v1, _up).normalize();
 
       const moveF = (this._keys.forward ? 1 : 0) - (this._keys.backward ? 1 : 0);
       const moveR = (this._keys.right ? 1 : 0) - (this._keys.left ? 1 : 0);
@@ -2069,15 +2144,12 @@ export class ControlsAndRaycast {
       this._fpPos.x = clamp(this._fpPos.x + this._fpVelocity.x * safeDt, -MAP_BOUND, MAP_BOUND);
       this._fpPos.z = clamp(this._fpPos.z + this._fpVelocity.z * safeDt, -MAP_BOUND, MAP_BOUND);
 
-      // Smooth circle-vs-circle sliding around trunks, boulders, stumps & campfire ring
       this.spatialHash.resolveCircle(this._fpPos, FP_PLAYER_RADIUS);
       this._fpPos.x = clamp(this._fpPos.x, -MAP_BOUND, MAP_BOUND);
       this._fpPos.z = clamp(this._fpPos.z, -MAP_BOUND, MAP_BOUND);
 
-      // Actual achieved ground speed (stops head-bob if blocked against a tree)
       const actualSpeed = Math.hypot(this._fpPos.x - prevX, this._fpPos.z - prevZ) / safeDt;
 
-      // Smooth terrain height following with subtle footstep head-bob scaled by actual speed
       const targetGroundY = Math.max(
         this.terrain.getHeightAt(this._fpPos.x, this._fpPos.z),
         WATER_LEVEL - 0.52
@@ -2097,11 +2169,9 @@ export class ControlsAndRaycast {
         this._fpPos.z
       );
 
-      // Part grass & ferns around the explorer's footsteps
       this._fpFootPos.set(this._fpPos.x, this._fpGroundY, this._fpPos.z);
       this.windSystem?.setInteractorTarget?.(this._fpFootPos, true);
 
-      // Center-screen hover raycast in First-Person mode
       this._hoveredTarget = this._pickInteractive(_centerNdc);
       this._updatePrompt();
     }

@@ -57,12 +57,16 @@ const PALETTE = {
   rayNoon: new THREE.Color(0xfff1cc),
   rayDawn: new THREE.Color(0xffc985),
   raySunset: new THREE.Color(0xff9a58),
+
+  // Lightning flash electric blue-white accents
+  lightningDirect: new THREE.Color(0xd8ecff),
+  lightningSky: new THREE.Color(0xbcd8ff),
 };
 
 /**
  * Full 24-hour atmospheric sky, dynamic sun/moon lighting, shadow management,
  * twinkling starfield dome, luminous cratered moon + halo, dynamic FogExp2,
- * and 22 volumetric canopy god-ray sunbeam shafts.
+ * rainstorm lightning/thunder flashes, and 22 volumetric canopy god-ray sunbeam shafts.
  */
 export class SkyLighting {
   constructor(scene, renderer, terrain) {
@@ -80,6 +84,7 @@ export class SkyLighting {
     this.daylight = 1.0;
     this.nightFactor = 0.0;
     this.sunIntensity = 1.0;
+    this.lightningFlash = 0.0;
 
     // Internal celestial vectors & smoothed weather blend state
     this._trueSunDir = new THREE.Vector3(0.4, 0.7, -0.4).normalize();
@@ -96,6 +101,15 @@ export class SkyLighting {
     this._galeBlend = 0.0;
     this._initialized = false;
     this._shadowMapSize = 2048;
+
+    // Rainstorm lightning strobe & distance-delayed thunderclap scheduler
+    this._onThunderCallback = null;
+    this._wasRaining = false;
+    this._nextLightningTimer = 4.0;
+    this._lightningAge = -1.0;
+    this._lightningDuration = 0.32;
+    this._lightningPeakStrength = 1.0;
+    this._pendingThunders = [];
 
     // 1. Procedural Preetham Sky dome (scaled to 450)
     this.sky = new Sky();
@@ -174,6 +188,7 @@ export class SkyLighting {
     material.uniforms.uNightMix = { value: 0.0 };
     material.uniforms.uNightZenith = { value: new THREE.Color(0x040814) };
     material.uniforms.uNightHorizon = { value: new THREE.Color(0x0e1a30) };
+    material.uniforms.uLightningFlash = { value: 0.0 };
 
     material.fragmentShader = material.fragmentShader.replace(
       'uniform float time;',
@@ -182,7 +197,8 @@ export class SkyLighting {
       uniform float uRainOvercast;
       uniform float uNightMix;
       uniform vec3 uNightZenith;
-      uniform vec3 uNightHorizon;`
+      uniform vec3 uNightHorizon;
+      uniform float uLightningFlash;`
     );
 
     material.fragmentShader = material.fragmentShader.replace(
@@ -200,6 +216,12 @@ export class SkyLighting {
       float nightGrad = pow( clamp( direction.y, 0.0, 1.0 ), 0.52 );
       vec3 nightSky = mix( uNightHorizon, uNightZenith, nightGrad );
       finalSky = mix( finalSky, max( finalSky, nightSky ), uNightMix );
+
+      if ( uLightningFlash > 0.001 ) {
+        float boltSkyGrad = smoothstep( -0.05, 0.72, direction.y );
+        vec3 boltGlow = vec3( 0.72, 0.86, 1.0 ) * ( 0.38 + boltSkyGrad * 0.92 );
+        finalSky += boltGlow * uLightningFlash * ( 0.52 + uRainOvercast * 0.65 );
+      }
 
       gl_FragColor = vec4( finalSky, 1.0 );`
     );
@@ -680,6 +702,86 @@ export class SkyLighting {
     this.sunLight.shadow.needsUpdate = true;
   }
 
+  setThunderCallback(fn) {
+    this._onThunderCallback = typeof fn === 'function' ? fn : null;
+  }
+
+  triggerLightning(immediateThunder = false) {
+    this._lightningAge = 0.0;
+    this._lightningDuration = 0.32;
+    this._lightningPeakStrength = 0.84 + Math.random() * 0.16;
+    this.lightningFlash = clamp(
+      this._evaluateLightningEnvelope(0.0) * this._lightningPeakStrength,
+      0.0,
+      1.0
+    );
+
+    const thunderIntensity = clamp(0.68 + this._lightningPeakStrength * 0.32, 0.5, 1.0);
+    if (immediateThunder) {
+      this._onThunderCallback?.(thunderIntensity);
+    } else {
+      const delay = 0.45 + Math.random() * 0.80; // 0.45–1.25s distance-delayed thunderclap
+      this._pendingThunders.push({ delay, intensity: thunderIntensity });
+    }
+  }
+
+  _evaluateLightningEnvelope(t) {
+    if (t < 0.0 || t >= this._lightningDuration) return 0.0;
+    // Dramatic double-peak strobe (~0.32s total): initial stroke (~0.028s) + return stroke (~0.175s)
+    const p1 = Math.exp(-Math.pow((t - 0.028) / (t < 0.028 ? 0.032 : 0.038), 2.0));
+    const p2 = 0.86 * Math.exp(-Math.pow((t - 0.175) / (t < 0.175 ? 0.022 : 0.064), 2.0));
+    const tailFade = 1.0 - smoothstep(0.26, this._lightningDuration, t);
+    return clamp(Math.max(p1, p2) * tailFade, 0.0, 1.0);
+  }
+
+  _updateLightningStorm(dt, isRaining) {
+    // Advance already-queued distance-delayed thunderclaps first
+    if (this._pendingThunders.length > 0 && dt > 0) {
+      for (let i = this._pendingThunders.length - 1; i >= 0; i--) {
+        this._pendingThunders[i].delay -= dt;
+        if (this._pendingThunders[i].delay <= 0) {
+          const item = this._pendingThunders[i];
+          this._pendingThunders.splice(i, 1);
+          this._onThunderCallback?.(item.intensity);
+        }
+      }
+    }
+
+    if (isRaining && !this._wasRaining) {
+      // First flash ~4s after entering Rain so storm feels alive immediately
+      this._nextLightningTimer = 3.8 + Math.random() * 0.4;
+    }
+    this._wasRaining = isRaining;
+
+    let justTriggered = false;
+    if (isRaining && dt > 0) {
+      this._nextLightningTimer -= dt;
+      if (this._nextLightningTimer <= 0) {
+        this.triggerLightning(false);
+        this._nextLightningTimer = 7.5 + Math.random() * 8.0; // 7.5–15.5s periodic bolts
+        justTriggered = true;
+      }
+    }
+
+    if (this._lightningAge >= 0) {
+      if (dt > 0 && !justTriggered) {
+        this._lightningAge += dt;
+      }
+      if (this._lightningAge >= this._lightningDuration) {
+        this._lightningAge = -1.0;
+        this.lightningFlash = 0.0;
+      } else {
+        this.lightningFlash = clamp(
+          this._evaluateLightningEnvelope(this._lightningAge) * this._lightningPeakStrength,
+          0.0,
+          1.0
+        );
+      }
+    } else {
+      this.lightningFlash = 0.0;
+    }
+  }
+
   update(
     dt,
     elapsed,
@@ -696,7 +798,8 @@ export class SkyLighting {
 
     // Smooth weather transition (snaps on very first update call)
     const wKey = String(weather || 'Clear').toLowerCase();
-    const targetRain = wKey === 'rain' ? 1.0 : 0.0;
+    const isRaining = wKey === 'rain';
+    const targetRain = isRaining ? 1.0 : 0.0;
     const targetGale = wKey === 'gale' ? 1.0 : 0.0;
     if (!this._initialized || safeDt === 0) {
       this._rainBlend = targetRain;
@@ -710,6 +813,10 @@ export class SkyLighting {
 
     const rain = this._rainBlend;
     const gale = this._galeBlend;
+
+    // Advance lightning storm strobe & delayed thunderclaps
+    this._updateLightningStorm(safeDt, isRaining);
+    const flash = this.lightningFlash;
 
     // 1. 24-hour orbital sun/moon geometry
     // Sunrise ~6:15, Solar Noon ~12:15 (66 deg elevation), Sunset ~18:15, Midnight ~0:15
@@ -863,13 +970,18 @@ export class SkyLighting {
     );
     this.fogColor.lerp(rainFog, rain * 0.84 + gale * 0.26);
 
-    // Sync calibrated Sky HDR exposure, overcast storm tint, and indigo night sky gradient
+    // Briefly illuminate sky, clouds, fog & directional tint with electric blue-white during lightning
+    if (flash > 0.001) {
+      this.sunColor.lerp(PALETTE.lightningDirect, clamp(flash * 0.88, 0.0, 1.0));
+      this.skyZenithColor.lerp(PALETTE.lightningSky, clamp(flash * 0.62, 0.0, 1.0));
+      this.skyHorizonColor.lerp(PALETTE.lightningSky, clamp(flash * 0.55, 0.0, 1.0));
+      this.fogColor.lerp(PALETTE.lightningSky, clamp(flash * 0.48, 0.0, 1.0));
+    }
+
+    // Sync calibrated Sky HDR exposure, overcast storm tint, lightning flash, and indigo night gradient
     if (skyUniforms.uSkyExposure) {
-      skyUniforms.uSkyExposure.value = lerp(
-        lerp(0.22, 0.44, goldenFactor),
-        0.16,
-        rain * 0.7
-      );
+      skyUniforms.uSkyExposure.value =
+        lerp(lerp(0.22, 0.44, goldenFactor), 0.16, rain * 0.7) + flash * 0.42;
     }
     if (skyUniforms.uRainOvercast) {
       skyUniforms.uRainOvercast.value = rain;
@@ -883,6 +995,9 @@ export class SkyLighting {
     if (skyUniforms.uNightHorizon) {
       skyUniforms.uNightHorizon.value.copy(this.fogColor);
     }
+    if (skyUniforms.uLightningFlash) {
+      skyUniforms.uLightningFlash.value = flash;
+    }
 
     // 5. Light intensities with seamless twilight dip during sun <-> moon handoff
     const handoffDip = 1.0 - 0.62 * Math.exp(-Math.pow((sunElev + 0.035) / 0.055, 2.0));
@@ -890,7 +1005,8 @@ export class SkyLighting {
     const moonDirect = 0.68 * smoothstep(-0.04, 0.28, this._moonDir.y) + 0.14;
     const rawDirect = lerp(dayDirect, moonDirect, moonHandoff) * handoffDip;
     const weatherDirectMult = (1.0 - rain * 0.64) * (1.0 - gale * 0.16);
-    const finalDirectIntensity = rawDirect * weatherDirectMult;
+    const finalDirectIntensity =
+      rawDirect * weatherDirectMult + flash * lerp(4.2, 5.4, nightFactor);
 
     this.sunLight.color.copy(this.sunColor);
     this.sunLight.intensity = finalDirectIntensity;
@@ -899,7 +1015,8 @@ export class SkyLighting {
     this.sunIntensity = clamp(
       (daylight * (0.45 + 0.55 * smoothstep(0.05, 0.55, sunElev)) * (1.0 - rain * 0.65) +
         nightFactor * 0.06 * (1.0 - rain * 0.5)) *
-        (1.0 - gale * 0.12),
+        (1.0 - gale * 0.12) +
+        flash * 0.72,
       0.02,
       1.0
     );
@@ -914,10 +1031,14 @@ export class SkyLighting {
     this.hemiLight.groundColor.copy(groundCol);
     this.hemiLight.intensity =
       lerp(0.95, 0.36, nightFactor) * (1.0 - rain * 0.18) * (1.0 - gale * 0.06) +
-      rain * 0.18 * daylight;
+      rain * 0.18 * daylight +
+      flash * 1.45;
 
     this.ambientLight.color.copy(this.skyZenithColor).lerp(this.fogColor, 0.45);
-    this.ambientLight.intensity = lerp(0.14, 0.26, nightFactor) + rain * 0.12;
+    if (flash > 0.001) {
+      this.ambientLight.color.lerp(PALETTE.lightningDirect, clamp(flash * 0.75, 0.0, 1.0));
+    }
+    this.ambientLight.intensity = lerp(0.14, 0.26, nightFactor) + rain * 0.12 + flash * 0.95;
 
     // 6. Position shadow light & center sky/stars/moon on camera
     const camPos = camera?.position;
@@ -1021,9 +1142,9 @@ export class SkyLighting {
 
     // 10. Dynamic recommended tone-mapping exposure & bloom strength
     const recommendedExposure =
-      lerp(1.02, 1.24, nightFactor) + goldenFactor * 0.06 + rain * 0.08;
+      lerp(1.02, 1.24, nightFactor) + goldenFactor * 0.06 + rain * 0.08 + flash * 0.16;
     const recommendedBloomStrength =
-      lerp(0.34, 0.68, nightFactor) + goldenFactor * 0.14 - rain * 0.08;
+      lerp(0.34, 0.68, nightFactor) + goldenFactor * 0.14 - rain * 0.08 + flash * 0.22;
 
     return {
       sunDir: this.sunDir,
@@ -1035,6 +1156,7 @@ export class SkyLighting {
       daylight: this.daylight,
       nightFactor: this.nightFactor,
       sunIntensity: this.sunIntensity,
+      lightningFlash: this.lightningFlash,
       recommendedExposure,
       recommendedBloomStrength: clamp(recommendedBloomStrength, 0.18, 0.85),
     };

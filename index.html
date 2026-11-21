@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="Interactive 3D procedural forest ecosystem simulation built with Three.js, featuring GPU wind waves, splat-blended terrain, meandering stream water, dynamic 24-hour sky lighting, volumetric sunbeams, boid bird flocks, and procedural Web Audio."
+      content="Interactive 3D procedural forest ecosystem simulation built with Three.js featuring a playable articulated human explorer with Foot IK, dynamic wildlife & climbing rats, GPU wind waves, meandering stream water, 24-hour sky lighting, and procedural Web Audio."
     />
     <title>Sylva — Interactive 3D Forest Simulation</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
@@ -27,19 +27,35 @@
           <span class="hud-dot" aria-hidden="true">•</span>
           <span id="hud-weather" class="hud-meta-item">Clear</span>
           <span class="hud-dot" aria-hidden="true">•</span>
-          <span id="hud-camera" class="hud-meta-item">Orbit</span>
+          <span id="hud-camera" class="hud-meta-item">Third-Person</span>
         </div>
       </header>
 
-      <!-- First-Person Crosshair (shown only in First-Person pointer-lock mode) -->
+      <!-- First-Person Body-Cam Crosshair (shown only when pointer-locked) -->
       <div id="crosshair" class="crosshair" aria-hidden="true">
         <span class="crosshair-ring"></span>
         <span class="crosshair-dot"></span>
       </div>
 
-      <!-- Contextual Interaction & Navigation Prompt -->
-      <div id="interaction-prompt" class="interaction-prompt" role="status" aria-live="polite">
-        <span id="prompt-text">Drag to orbit • Scroll to zoom • Click campfire or birds • Press C for First-Person</span>
+      <!-- Bottom-Center Stack: Reaction Alert + Auto-Hiding Stamina Bar + Contextual Prompt -->
+      <div class="hud-bottom-center">
+        <div id="reaction-badge" class="reaction-badge hidden-fade" role="status" aria-live="polite">
+          <span id="reaction-text"></span>
+        </div>
+
+        <div id="stamina-container" class="stamina-container hidden-fade" aria-label="Explorer stamina">
+          <div class="stamina-header">
+            <span id="stamina-label" class="stamina-label">Stamina</span>
+            <span id="stamina-pct" class="stamina-pct">100%</span>
+          </div>
+          <div class="stamina-track">
+            <div id="stamina-fill" class="stamina-fill"></div>
+          </div>
+        </div>
+
+        <div id="interaction-prompt" class="interaction-prompt" role="status" aria-live="polite">
+          <span id="prompt-text">WASD Move • Hold Shift Sprint • Click campfire or birds • Press R for Rat Scare</span>
+        </div>
       </div>
 
       <!-- Bottom-Left Minimal Utility Dock -->
@@ -81,24 +97,39 @@
           id="camera-toggle"
           class="dock-btn"
           type="button"
-          title="Switch between Orbit and First-Person Explorer (C)"
-          aria-label="Switch camera mode"
+          title="Cycle camera view: Third-Person, First-Person Body, Free Orbit (V)"
+          aria-label="Cycle camera mode"
         >
           <svg class="dock-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3" />
             <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
           </svg>
-          <span id="camera-btn-label">First-Person</span>
-          <kbd class="key-hint">C</kbd>
+          <span id="camera-btn-label">Third-Person</span>
+          <kbd class="key-hint">V</kbd>
         </button>
       </div>
+
+      <!-- Bottom-Right Subtle Keybind Legend -->
+      <aside class="keybind-legend" aria-label="Controls reference">
+        <span class="kb-item"><kbd>WASD</kbd> Move</span>
+        <span class="kb-sep" aria-hidden="true">·</span>
+        <span class="kb-item"><kbd>Shift</kbd> Sprint</span>
+        <span class="kb-sep" aria-hidden="true">·</span>
+        <span class="kb-item"><kbd>Space</kbd> Jump</span>
+        <span class="kb-sep" aria-hidden="true">·</span>
+        <span class="kb-item"><kbd>C</kbd> Crouch</span>
+        <span class="kb-sep" aria-hidden="true">·</span>
+        <span class="kb-item"><kbd>R</kbd> Rat Scare</span>
+        <span class="kb-sep" aria-hidden="true">·</span>
+        <span class="kb-item"><kbd>V</kbd> Camera</span>
+      </aside>
     </div>
 
     <!-- Clean Loading Veil -->
     <div id="loading-screen" class="loading-screen" role="status" aria-live="polite">
       <div class="loading-inner">
         <div class="loading-title">Sylva</div>
-        <div id="loading-status" class="loading-status">Sculpting valley &amp; procedural foliage…</div>
+        <div id="loading-status" class="loading-status">Sculpting valley, explorer &amp; wildlife…</div>
         <div class="loading-bar-track">
           <div id="loading-bar-fill" class="loading-bar-fill"></div>
         </div>

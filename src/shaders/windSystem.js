@@ -28,6 +28,14 @@ export class WindSystem {
     this._targetInteractorStrength = 0.0;
     this._currentInteractorStrength = 0.0;
 
+    // Smoothed dual human foot/shin positions for crisp two-boot grass & fern parting
+    this._targetFootLeftPos = new THREE.Vector3(0, -100, 0);
+    this._currentFootLeftPos = new THREE.Vector3(0, -100, 0);
+    this._targetFootRightPos = new THREE.Vector3(0, -100, 0);
+    this._currentFootRightPos = new THREE.Vector3(0, -100, 0);
+    this._targetFootStrength = 0.0;
+    this._currentFootStrength = 0.0;
+
     // Shared GPU uniforms referenced directly by every vegetation material
     this.uniforms = {
       uTime: { value: 0 },
@@ -40,6 +48,10 @@ export class WindSystem {
       uInteractorPos: { value: this._currentInteractorPos },
       uInteractorRadius: { value: 2.5 },
       uInteractorStrength: { value: 0.0 },
+      uFootLeftPos: { value: this._currentFootLeftPos },
+      uFootRightPos: { value: this._currentFootRightPos },
+      uFootRadius: { value: 1.05 },
+      uFootStrength: { value: 0.0 },
       uWetness: { value: 0.0 },
     };
 
@@ -143,16 +155,56 @@ export class WindSystem {
     }
   }
 
+  /**
+   * Update dual human foot/shin world positions for crisp two-boot foliage parting.
+   * Passing active=false lets flattened grass & ferns spring back upright naturally.
+   */
+  setHumanFeet(leftPos, rightPos, active = true) {
+    if (active && (leftPos || rightPos)) {
+      if (leftPos) {
+        this._targetFootLeftPos.copy(leftPos);
+        if (this._currentFootLeftPos.y < -50) {
+          this._currentFootLeftPos.copy(leftPos);
+        }
+      } else {
+        this._targetFootLeftPos.set(0, -100, 0);
+      }
+
+      if (rightPos) {
+        this._targetFootRightPos.copy(rightPos);
+        if (this._currentFootRightPos.y < -50) {
+          this._currentFootRightPos.copy(rightPos);
+        }
+      } else {
+        this._targetFootRightPos.set(0, -100, 0);
+      }
+
+      this._targetFootStrength = 1.0;
+    } else {
+      this._targetFootStrength = 0.0;
+    }
+  }
+
   update(dt, elapsed) {
+    const safeDt = Math.max(dt || 0, 0);
     this.uniforms.uTime.value = elapsed;
 
     // Smoothly track interactor position & spring-back strength
-    const posFollow = 1.0 - Math.exp(-dt * 14.0);
-    const strFollow = 1.0 - Math.exp(-dt * (this._targetInteractorStrength > 0.5 ? 12.0 : 5.5));
+    const posFollow = 1.0 - Math.exp(-safeDt * 14.0);
+    const strFollow = 1.0 - Math.exp(-safeDt * (this._targetInteractorStrength > 0.5 ? 12.0 : 5.5));
     this._currentInteractorPos.lerp(this._targetInteractorPos, posFollow);
     this._currentInteractorStrength +=
       (this._targetInteractorStrength - this._currentInteractorStrength) * strFollow;
     this.uniforms.uInteractorStrength.value = this._currentInteractorStrength;
+
+    // Smoothly track dual human feet/shins with quick underfoot bend & natural spring-back
+    const footPosFollow = 1.0 - Math.exp(-safeDt * 18.0);
+    const footStrFollow = 1.0 - Math.exp(-safeDt * (this._targetFootStrength > 0.5 ? 14.0 : 4.2));
+    this._currentFootLeftPos.lerp(this._targetFootLeftPos, footPosFollow);
+    this._currentFootRightPos.lerp(this._targetFootRightPos, footPosFollow);
+    this._currentFootStrength +=
+      (this._targetFootStrength - this._currentFootStrength) * footStrFollow;
+    this.uniforms.uFootStrength.value = this._currentFootStrength;
   }
 
   /**
@@ -409,6 +461,10 @@ export class WindSystem {
         uniform vec3 uInteractorPos;
         uniform float uInteractorRadius;
         uniform float uInteractorStrength;
+        uniform vec3 uFootLeftPos;
+        uniform vec3 uFootRightPos;
+        uniform float uFootRadius;
+        uniform float uFootStrength;
         varying float vFoliageTip;
         varying float vGustHighlight;`
       );
@@ -470,6 +526,48 @@ export class WindSystem {
           float bendOut = falloff * ${partStrength} * bendFactor;
           windOffset += pushLocal * bendOut;
           windOffset.y -= falloff * 0.42 * bendFactor;
+        }
+
+        // Dual human boot/shin parting & crisp underfoot flattening within uFootRadius
+        if ( uFootStrength > 0.001 && uFootRadius > 0.001 ) {
+          float footRad = uFootRadius;
+          float footRadSq = footRad * footRad;
+          float combinedFootFalloff = 0.0;
+
+          // Left foot/shin parting
+          vec2 toLeftFoot = fInstOrigin.xz - uFootLeftPos.xz;
+          float leftDistSq = dot( toLeftFoot, toLeftFoot );
+          float leftHeightDiff = abs( fInstOrigin.y - uFootLeftPos.y );
+          if ( leftDistSq < footRadSq && leftHeightDiff < 1.8 ) {
+            float leftDist = sqrt( leftDistSq );
+            float radialFalloff = 1.0 - smoothstep( 0.0, footRad, leftDist );
+            float heightFade = 1.0 - smoothstep( 0.95, 1.8, leftHeightDiff );
+            float footFalloff = radialFalloff * radialFalloff * heightFade * uFootStrength;
+            vec2 leftPushDir = leftDist > 0.001 ? ( toLeftFoot / leftDist ) : vec2( 1.0, 0.0 );
+            vec3 leftPushLocal = normalize( fInvRot * vec3( leftPushDir.x, 0.0, leftPushDir.y ) + vec3( 1e-5 ) );
+            windOffset += leftPushLocal * ( footFalloff * ${partStrength} * 1.32 * bendFactor );
+            combinedFootFalloff += footFalloff;
+          }
+
+          // Right foot/shin parting
+          vec2 toRightFoot = fInstOrigin.xz - uFootRightPos.xz;
+          float rightDistSq = dot( toRightFoot, toRightFoot );
+          float rightHeightDiff = abs( fInstOrigin.y - uFootRightPos.y );
+          if ( rightDistSq < footRadSq && rightHeightDiff < 1.8 ) {
+            float rightDist = sqrt( rightDistSq );
+            float radialFalloff = 1.0 - smoothstep( 0.0, footRad, rightDist );
+            float heightFade = 1.0 - smoothstep( 0.95, 1.8, rightHeightDiff );
+            float footFalloff = radialFalloff * radialFalloff * heightFade * uFootStrength;
+            vec2 rightPushDir = rightDist > 0.001 ? ( toRightFoot / rightDist ) : vec2( -1.0, 0.0 );
+            vec3 rightPushLocal = normalize( fInvRot * vec3( rightPushDir.x, 0.0, rightPushDir.y ) + vec3( 1e-5 ) );
+            windOffset += rightPushLocal * ( footFalloff * ${partStrength} * 1.32 * bendFactor );
+            combinedFootFalloff += footFalloff;
+          }
+
+          if ( combinedFootFalloff > 0.0 ) {
+            float clampedFootFalloff = min( combinedFootFalloff, 1.08 );
+            windOffset.y -= clampedFootFalloff * 0.68 * bendFactor;
+          }
         }
 
         transformed += windOffset;`

@@ -151,11 +151,11 @@ export class Terrain {
       const valleyBlend = (1.0 - bankT) * 0.86;
       h = lerp(h, Math.min(h, Math.max(bankTarget, -0.2)), valleyBlend);
 
-      // Inner river channel carving below WATER_LEVEL (y = 0)
+      // Inner river channel carving below WATER_LEVEL (y = 0) to a realistic knee-to-thigh wading depth
       if (distStream < halfW * 1.45) {
         const channelT = smootherstep(0.0, halfW * 1.38, distStream);
-        const bedRipples = this._noiseDetail(x * 0.28, z * 0.28) * 0.14;
-        const bedDepth = -1.68 + bedRipples;
+        const bedRipples = this._noiseDetail(x * 0.28, z * 0.28) * 0.11;
+        const bedDepth = -0.76 + bedRipples;
         const carved = lerp(bedDepth, 0.42, channelT);
         const carveMask = 1.0 - smootherstep(halfW * 0.92, halfW * 1.45, distStream);
         h = lerp(h, Math.min(h, carved), carveMask);
