@@ -1,0 +1,20 @@
+{
+  "name": "forest-simulation",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^8.3.6"
+  },
+  "dependencies": {
+    "lil-gui": "^0.21.0",
+    "simplex-noise": "^4.0.3",
+    "stats.js": "^0.17.0",
+    "three": "^0.187.0"
+  }
+}
