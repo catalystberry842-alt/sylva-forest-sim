@@ -328,16 +328,25 @@ const SCOPED_CSS = /* css */ `
     inset 0 1px 2px rgba(255, 240, 210, 0.3);
 }
 
-/* Bottom-Right Action Button Cluster (52×52px ergonomic touch targets) */
+/* Bottom-Right Action Button Cluster (48-52px ergonomic touch targets) */
 .mc-actions {
   position: absolute;
-  right: max(20px, calc(env(safe-area-inset-right, 0px) + 18px));
+  right: max(18px, calc(env(safe-area-inset-right, 0px) + 16px));
   bottom: max(22px, calc(env(safe-area-inset-bottom, 0px) + 18px));
   z-index: 2;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 11px;
+  gap: 10px;
+  pointer-events: none;
+}
+
+.mc-actions-upper {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
   pointer-events: none;
 }
 
@@ -345,8 +354,12 @@ const SCOPED_CSS = /* css */ `
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 11px;
+  gap: 9px;
   pointer-events: none;
+}
+
+.mc-actions-row--primary {
+  gap: 10px;
 }
 
 .mc-btn {
@@ -375,11 +388,31 @@ const SCOPED_CSS = /* css */ `
   transition: transform 90ms ease, background 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
 }
 
+.mc-btn--compact {
+  width: 48px;
+  height: 48px;
+  min-width: 48px;
+  min-height: 48px;
+}
+
+.mc-btn-icon-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  pointer-events: none;
+}
+
 .mc-btn-icon {
   width: 17px;
   height: 17px;
   flex-shrink: 0;
   pointer-events: none;
+}
+
+.mc-btn--compact .mc-btn-icon {
+  width: 16px;
+  height: 16px;
 }
 
 .mc-btn-label {
@@ -390,6 +423,10 @@ const SCOPED_CSS = /* css */ `
   line-height: 1;
   text-transform: uppercase;
   pointer-events: none;
+}
+
+.mc-btn--compact .mc-btn-label {
+  font-size: 8px;
 }
 
 .mc-btn-badge {
@@ -409,6 +446,10 @@ const SCOPED_CSS = /* css */ `
   pointer-events: none;
 }
 
+.mc-btn-badge.is-empty {
+  display: none;
+}
+
 .mc-btn.is-pressed {
   transform: scale(0.91);
   background: rgba(28, 38, 31, 0.86);
@@ -424,6 +465,53 @@ const SCOPED_CSS = /* css */ `
     0 8px 22px rgba(0, 0, 0, 0.38),
     0 0 16px rgba(142, 182, 126, 0.36),
     inset 0 0 10px rgba(142, 182, 126, 0.16);
+}
+
+/* Deep-water swim state highlight (UP / DIVE) */
+.mc-btn.is-water {
+  background: rgba(12, 34, 42, 0.78);
+  border-color: rgba(88, 224, 240, 0.56);
+  color: #c8f7ff;
+  box-shadow:
+    0 8px 22px rgba(0, 0, 0, 0.36),
+    0 0 14px rgba(72, 218, 238, 0.24),
+    inset 0 1px 0 rgba(180, 248, 255, 0.16);
+}
+
+.mc-btn.is-water.is-active,
+.mc-btn.is-water.is-pressed {
+  background: rgba(16, 52, 64, 0.9);
+  border-color: #62eefc;
+  color: #ebfdff;
+  box-shadow:
+    0 8px 22px rgba(0, 0, 0, 0.4),
+    0 0 18px rgba(82, 232, 248, 0.46);
+}
+
+/* Warm golden-amber accent for CHAR switcher */
+.mc-btn--char {
+  border-color: rgba(226, 164, 82, 0.4);
+  color: #f6ddb0;
+}
+
+.mc-btn--char.is-pressed {
+  background: rgba(48, 34, 18, 0.88);
+  border-color: #e2a452;
+  color: #fff2d4;
+  box-shadow: 0 0 16px rgba(226, 164, 82, 0.42);
+}
+
+/* Forest-sage sparkle accent for EMOTE cycler */
+.mc-btn--emote {
+  border-color: rgba(142, 182, 126, 0.38);
+  color: #d6ecc8;
+}
+
+.mc-btn--emote.is-pressed {
+  background: rgba(28, 44, 30, 0.88);
+  border-color: #8eb67e;
+  color: #ecfae2;
+  box-shadow: 0 0 16px rgba(142, 182, 126, 0.42);
 }
 
 /* Primary jump tactile accent */
@@ -471,21 +559,41 @@ body.${BODY_ACTIVE_CLASS} .hud-dock {
   }
 }
 
+/* Stack secondary RPG + utility rows cleanly on narrow portrait screens */
+@media (max-width: 520px) {
+  .mc-actions-upper {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+  }
+}
+
+/* Compact landscape mobile ergonomics (e.g. 844×390) with zero top-center compass collision */
 @media (max-height: 460px) {
   .mc-actions {
     gap: 8px;
-    bottom: max(20px, calc(env(safe-area-inset-bottom, 0px) + 16px));
+    bottom: max(18px, calc(env(safe-area-inset-bottom, 0px) + 14px));
   }
 
-  .mc-actions-row {
+  .mc-actions-upper,
+  .mc-actions-row,
+  .mc-actions-row--primary {
     gap: 8px;
+  }
+
+  .mc-btn--cam,
+  .mc-btn--rat {
+    width: 48px;
+    height: 48px;
+    min-width: 48px;
+    min-height: 48px;
   }
 
   body.${BODY_ACTIVE_CLASS} .hud-dock {
     bottom: auto;
-    top: 16px;
-    left: 50%;
-    transform: translateX(-50%);
+    top: 72px;
+    left: 16px;
+    transform: none;
   }
 }
 `;
@@ -500,22 +608,48 @@ function ensureStylesInjected() {
   document.head.appendChild(style);
 }
 
-function createActionButton({ action, label, ariaLabel, extraClass = '', iconSvg, badgeText = '' }) {
+function createActionButton({
+  action,
+  label,
+  ariaLabel,
+  extraClass = '',
+  iconSvg,
+  badgeText = '',
+  hasBadge = false,
+}) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = extraClass ? `mc-btn ${extraClass}` : 'mc-btn';
   btn.dataset.action = action;
   btn.setAttribute('aria-label', ariaLabel);
 
-  const badgeHtml = badgeText ? `<span class="mc-btn-badge">${badgeText}</span>` : '';
-  btn.innerHTML = `${iconSvg}<span class="mc-btn-label">${label}</span>${badgeHtml}`;
+  const iconWrap = document.createElement('span');
+  iconWrap.className = 'mc-btn-icon-wrap';
+  iconWrap.setAttribute('aria-hidden', 'true');
+  iconWrap.innerHTML = iconSvg;
+  btn.appendChild(iconWrap);
+
+  const labelEl = document.createElement('span');
+  labelEl.className = 'mc-btn-label';
+  labelEl.textContent = label;
+  btn.appendChild(labelEl);
+  btn._labelEl = labelEl;
+
+  if (badgeText || hasBadge) {
+    const badgeEl = document.createElement('span');
+    badgeEl.className = badgeText ? 'mc-btn-badge' : 'mc-btn-badge is-empty';
+    badgeEl.textContent = badgeText || '';
+    btn.appendChild(badgeEl);
+    btn._badgeEl = badgeEl;
+  }
+
   return btn;
 }
 
 /**
  * Responsive Multi-Touch HUD overlay for mobile & tablet play.
  * Uses strict `pointerId` isolation across left analog thumbstick, right-side
- * look/pinch zone, and bottom-right 52×52px tactile action buttons.
+ * look/pinch zone, and bottom-right 48-52px tactile action buttons.
  */
 export class MobileControls {
   constructor(inputManager, options = {}) {
@@ -554,6 +688,8 @@ export class MobileControls {
     this._runToggled = false;
 
     this._cameraMode = 'Third-Person';
+    this._inDeepWater = false;
+    this._characterName = '';
     this._visible = false;
     this._disposed = false;
 
@@ -626,19 +762,50 @@ export class MobileControls {
     this._stickZone.appendChild(this._stickBase);
     this._root.appendChild(this._stickZone);
 
-    // 3. Bottom-Right Ergonomic 52×52px Action Cluster
+    // 3. Bottom-Right Ergonomic Action Cluster (CHAR, EMOTE, CAM, RAT! + CROUCH/DIVE, RUN, JUMP/UP)
     this._actionsContainer = document.createElement('div');
     this._actionsContainer.className = 'mc-actions';
     this._actionsContainer.setAttribute('role', 'group');
     this._actionsContainer.setAttribute('aria-label', 'Explorer actions');
 
-    const topRow = document.createElement('div');
-    topRow.className = 'mc-actions-row';
+    const upperGroup = document.createElement('div');
+    upperGroup.className = 'mc-actions-upper';
+
+    const rpgRow = document.createElement('div');
+    rpgRow.className = 'mc-actions-row mc-actions-row--rpg';
+
+    const utilRow = document.createElement('div');
+    utilRow.className = 'mc-actions-row mc-actions-row--util';
 
     const bottomRow = document.createElement('div');
-    bottomRow.className = 'mc-actions-row';
+    bottomRow.className = 'mc-actions-row mc-actions-row--primary';
 
     this._buttons = {
+      char: createActionButton({
+        action: 'char',
+        label: 'CHAR',
+        ariaLabel: 'Switch character',
+        extraClass: 'mc-btn--char mc-btn--compact',
+        hasBadge: true,
+        iconSvg:
+          '<svg class="mc-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+          '<circle cx="9" cy="7.5" r="3.2"/>' +
+          '<path d="M3.5 18.5a5.5 5.5 0 0 1 11 0"/>' +
+          '<path d="M16 7h4.5m0 0-2-2m2 2-2 2"/>' +
+          '<path d="M20.5 14H16m0 0 2-2m-2 2 2 2"/>' +
+          '</svg>',
+      }),
+      emote: createActionButton({
+        action: 'emote',
+        label: 'EMOTE',
+        ariaLabel: 'Cycle explorer emote',
+        extraClass: 'mc-btn--emote mc-btn--compact',
+        iconSvg:
+          '<svg class="mc-btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+          '<path d="M12 3l1.7 4.8L18.5 9.5l-4.8 1.7L12 16l-1.7-4.8-4.8-1.7 4.8-1.7L12 3Z"/>' +
+          '<path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z"/>' +
+          '</svg>',
+      }),
       cam: createActionButton({
         action: 'cam',
         label: 'CAM',
@@ -699,16 +866,25 @@ export class MobileControls {
 
     this._buttons.run.setAttribute('aria-pressed', 'false');
     this._buttons.crouch.setAttribute('aria-pressed', 'false');
-    this._camBadge = this._buttons.cam.querySelector?.('.mc-btn-badge') || null;
+    this._camBadge = this._buttons.cam._badgeEl || this._buttons.cam.querySelector?.('.mc-btn-badge') || null;
+    this._charBadge = this._buttons.char._badgeEl || this._buttons.char.querySelector?.('.mc-btn-badge') || null;
+    this._jumpLabel = this._buttons.jump._labelEl || this._buttons.jump.querySelector?.('.mc-btn-label') || null;
+    this._crouchLabel = this._buttons.crouch._labelEl || this._buttons.crouch.querySelector?.('.mc-btn-label') || null;
 
-    topRow.appendChild(this._buttons.cam);
-    topRow.appendChild(this._buttons.rat);
+    rpgRow.appendChild(this._buttons.char);
+    rpgRow.appendChild(this._buttons.emote);
+
+    utilRow.appendChild(this._buttons.cam);
+    utilRow.appendChild(this._buttons.rat);
+
+    upperGroup.appendChild(rpgRow);
+    upperGroup.appendChild(utilRow);
 
     bottomRow.appendChild(this._buttons.crouch);
     bottomRow.appendChild(this._buttons.run);
     bottomRow.appendChild(this._buttons.jump);
 
-    this._actionsContainer.appendChild(topRow);
+    this._actionsContainer.appendChild(upperGroup);
     this._actionsContainer.appendChild(bottomRow);
     this._root.appendChild(this._actionsContainer);
 
@@ -899,6 +1075,7 @@ export class MobileControls {
           this._buttons.run.classList.add('is-active');
           this._buttons.run.setAttribute('aria-pressed', 'true');
         } else if (action === 'jump') {
+          this.inputManager?.setTouchJump?.(true);
           this.inputManager?.triggerJump?.();
         } else if (action === 'crouch') {
           this.inputManager?.toggleCrouch?.();
@@ -909,6 +1086,10 @@ export class MobileControls {
           this.inputManager?.triggerRatScare?.();
         } else if (action === 'cam') {
           this.inputManager?.triggerCameraCycle?.();
+        } else if (action === 'char') {
+          this.inputManager?.triggerCharacterSwitch?.();
+        } else if (action === 'emote') {
+          this.inputManager?.triggerEmoteCycle?.();
         }
       };
 
@@ -1017,6 +1198,8 @@ export class MobileControls {
       const active = Boolean(this._runToggled || this.inputManager?.isSprinting?.());
       this._buttons.run.classList.toggle('is-active', active);
       this._buttons.run.setAttribute('aria-pressed', String(active));
+    } else if (entry.action === 'jump') {
+      this.inputManager?.setTouchJump?.(false);
     }
   }
 
@@ -1040,6 +1223,7 @@ export class MobileControls {
     this._buttons.run.classList.remove('is-active');
     this._buttons.run.setAttribute('aria-pressed', 'false');
     this.inputManager?.setTouchSprint?.(false);
+    this.inputManager?.setTouchJump?.(false);
   }
 
   // ---------------------------------------------------------------------------
@@ -1066,7 +1250,13 @@ export class MobileControls {
     return this._visible;
   }
 
-  syncButtonStates({ sprinting, crouching, cameraMode } = {}) {
+  syncButtonStates({
+    sprinting,
+    crouching,
+    cameraMode,
+    inDeepWater = false,
+    characterName = '',
+  } = {}) {
     if (sprinting !== undefined) {
       const isSprint = Boolean(sprinting);
       if (!isSprint && this._runPointerId === null && !this.inputManager?.isSprinting?.()) {
@@ -1091,6 +1281,40 @@ export class MobileControls {
         this._camBadge.textContent = badge;
       }
       this._lookZone.classList.toggle('is-free-orbit', cameraMode === 'Free Orbit');
+    }
+
+    const diving = Boolean(inDeepWater);
+    this._inDeepWater = diving;
+    if (this._jumpLabel) {
+      this._jumpLabel.textContent = diving ? 'UP' : 'JUMP';
+    }
+    if (this._crouchLabel) {
+      this._crouchLabel.textContent = diving ? 'DIVE' : 'CROUCH';
+    }
+    this._buttons.jump.dataset.swimMode = String(diving);
+    this._buttons.crouch.dataset.swimMode = String(diving);
+    this._buttons.jump.classList.toggle('is-water', diving);
+    this._buttons.crouch.classList.toggle('is-water', diving);
+    this._buttons.jump.setAttribute('aria-label', diving ? 'Swim up' : 'Jump');
+    this._buttons.crouch.setAttribute('aria-label', diving ? 'Dive underwater' : 'Toggle crouch');
+
+    const safeCharName = typeof characterName === 'string' ? characterName.trim() : '';
+    this._characterName = safeCharName;
+    if (this._buttons.char) {
+      this._buttons.char.dataset.characterName = safeCharName;
+      this._buttons.char.setAttribute(
+        'aria-label',
+        safeCharName ? `Switch character (current: ${safeCharName})` : 'Switch character'
+      );
+      if (this._charBadge) {
+        if (safeCharName) {
+          this._charBadge.textContent = safeCharName.slice(0, 3).toUpperCase();
+          this._charBadge.classList.remove('is-empty');
+        } else {
+          this._charBadge.textContent = '';
+          this._charBadge.classList.add('is-empty');
+        }
+      }
     }
   }
 

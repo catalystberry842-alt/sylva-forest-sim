@@ -3,22 +3,22 @@ import { lerp, clamp } from '../utils/random.js';
 
 const STREAM_Z_MIN = -120;
 const STREAM_Z_MAX = 120;
-const WIDTH_SEGMENTS = 48;
-const LENGTH_SEGMENTS = 260;
+const WIDTH_SEGMENTS = 64;
+const LENGTH_SEGMENTS = 300;
 const MAX_IMPACT_RIPPLES = 10;
 const MAX_BRIDGE_PILINGS = 8;
 const SPLASH_POOL_SIZE = 240;
 const SPLASH_GRAVITY = -13.5;
 
 /**
- * Procedural meandering forest stream ribbon with custom WebGL2-safe GLSL water shader:
- * - Dual-scrolling downstream ripple waves + cross wind chop + concentric raindrop rings
- * - Dynamic expanding impact ripples & pooled glistening splash droplet bursts
- * - Turbulent bridge-piling white-water foam collars & downstream V-wakes
- * - Schlick Fresnel sky reflection + crisp sun/moon specular glints
- * - Exponential depth color absorption (warm emerald shallows -> deep forest teal)
- * - Animated noise-broken shoreline foam + downstream riffle highlights
- * - High-clarity shallow projected riverbed pebble caustics + matching FogExp2 attenuation
+ * Procedural meandering forest stream & deep swimming lagoon water mesh with custom WebGL2-safe GLSL shader:
+ * - Multi-directional 4-wave Gerstner vertex swell + 4-octave animated fBm capillary normal perturbation
+ * - Physically inspired Beer-Lambert depth absorption (crystal turquoise shallows -> deep emerald-sapphire lagoon)
+ * - Dual-layer animated Voronoi riverbed caustics clearly illuminating shallow pebbles & fading into lagoon depth
+ * - Schlick Fresnel sky + drifted-cloud reflection & crisp dual-lobe sun/moon specular sparkles
+ * - DoubleSide underwater Snell's window, total internal reflection & ripple refraction when viewed from below
+ * - Dynamic expanding impact ripples, pooled glistening splash droplet bursts, bridge-piling white-water V-wakes,
+ *   and live swimmer wake collar + trailing Kelvin V-wake froth
  */
 export class StreamWater {
   constructor(terrain, windSystem = null) {
@@ -32,6 +32,11 @@ export class StreamWater {
     this._splashCursor = 0;
     this._activeSplashCount = 0;
     this._splashDirty = false;
+
+    // Pre-allocated swimmer tracking scratch state (zero per-frame allocations)
+    this._prevSwimmerPos = new THREE.Vector3(9999, 0, 9999);
+    this._hasPrevSwimmer = false;
+    this._swimmerIsSwimming = false;
 
     this.uniforms = {
       uTime: { value: 0.0 },
@@ -50,6 +55,10 @@ export class StreamWater {
           ? windSystem.uniforms.uWindDir.value.clone()
           : new THREE.Vector2(1.0, 0.0),
       },
+      uSwimmerPos: { value: new THREE.Vector3(9999, 0, 9999) },
+      uSwimmerSpeed: { value: 0.0 },
+      uSwimmerDir: { value: new THREE.Vector2(0.0, 1.0) },
+      uSwimmerActive: { value: 0.0 },
       uImpactRipples: {
         value: Array.from(
           { length: MAX_IMPACT_RIPPLES },
@@ -95,7 +104,7 @@ export class StreamWater {
     const flowVec = new THREE.Vector2();
 
     // Precompute smooth lateral left/right spans starting from the standard ribbon half-width
-    // and extending across any contiguous submerged bank coves so water always tucks under dry ground
+    // and extending across any contiguous submerged bank coves & lagoon shelves so water always tucks under dry ground
     const zs = new Float32Array(rows);
     const cxs = new Float32Array(rows);
     const leftSpans = new Float32Array(rows);
@@ -123,7 +132,7 @@ export class StreamWater {
       rightSpans[iz] = rSpan;
     }
 
-    // Gentle 5-tap smoothing pass along stream length so cove transitions stay fluid
+    // Gentle 5-tap smoothing pass along stream length so cove & lagoon transitions stay fluid
     const smoothLeft = new Float32Array(rows);
     const smoothRight = new Float32Array(rows);
     for (let iz = 0; iz <= lSegs; iz++) {
@@ -233,7 +242,7 @@ export class StreamWater {
       transparent: true,
       depthWrite: false,
       depthTest: true,
-      side: THREE.FrontSide,
+      side: THREE.DoubleSide,
       vertexShader: /* glsl */ `
         attribute float aBedHeight;
         attribute vec2 aFlowDir;
@@ -241,25 +250,95 @@ export class StreamWater {
         uniform float uTime;
         uniform float uWaterLevel;
         uniform float uWindSpeed;
+        uniform vec2 uWindDir;
 
         varying vec3 vWorldPos;
         varying vec2 vUv;
         varying float vBedHeight;
         varying vec2 vFlowDir;
+        varying vec2 vGerstnerSlope;
+        varying float vWaveCrest;
+
+        // Accumulates a physically inspired directional Gerstner wave displacement & tangent basis
+        void addGerstnerWave(
+          vec2 xz,
+          vec2 dir,
+          float wavelength,
+          float steepness,
+          float amp,
+          float speed,
+          float t,
+          inout vec3 disp,
+          inout vec3 tangent,
+          inout vec3 binormal
+        ) {
+          float k = 6.2831853 / wavelength;
+          float c = sqrt( 9.81 / k ) * speed;
+          vec2 d = normalize( dir );
+          float f = k * ( dot( d, xz ) - c * t );
+          float s = sin( f );
+          float co = cos( f );
+
+          float qa = steepness / max( k * amp * 4.0, 0.001 );
+          float qAmp = min( qa * amp, amp * 1.45 );
+
+          disp.x += d.x * qAmp * co;
+          disp.y += amp * s;
+          disp.z += d.y * qAmp * co;
+
+          float wa = k * amp;
+          float wq = k * qAmp;
+
+          tangent += vec3(
+            -d.x * d.x * wq * s,
+            d.x * wa * co,
+            -d.x * d.y * wq * s
+          );
+          binormal += vec3(
+            -d.x * d.y * wq * s,
+            d.y * wa * co,
+            -d.y * d.y * wq * s
+          );
+        }
 
         void main() {
           vUv = uv;
           vBedHeight = aBedHeight;
-          vFlowDir = normalize( aFlowDir + vec2( 1e-5, 0.0 ) );
+          vec2 flowDir = normalize( aFlowDir + vec2( 1e-5, 0.0 ) );
+          vFlowDir = flowDir;
 
           vec3 pos = position;
+          vec2 windDir = normalize( uWindDir + vec2( 1e-5, 0.0 ) );
 
-          // Keep shoreline pinned strictly to water level; gently breathe deep mid-stream
+          // Keep shoreline pinned strictly to water level; build multi-directional Gerstner swell across deeper stream & lagoon fetch
           float depth = max( uWaterLevel - aBedHeight, 0.0 );
-          float deepMask = smoothstep( 0.08, 0.65, depth );
-          float swell = sin( uv.y * 5.2 - uTime * 2.1 + uv.x * 1.4 ) * 0.011
-                      + cos( uv.y * 8.6 - uTime * 3.1 - uv.x * 2.6 ) * 0.006;
-          pos.y += swell * deepMask * clamp( 0.65 + uWindSpeed * 0.3, 0.65, 1.8 );
+          float deepMask = smoothstep( 0.06, 0.72, depth );
+          float lagoonFetch = 1.0 + smoothstep( 0.80, 2.85, depth ) * 1.25;
+          float windGain = clamp( 0.68 + uWindSpeed * 0.42, 0.68, 2.25 );
+          float ampScale = deepMask * lagoonFetch * windGain;
+
+          vec3 disp = vec3( 0.0 );
+          vec3 tangent = vec3( 1.0, 0.0, 0.0 );
+          vec3 binormal = vec3( 0.0, 0.0, 1.0 );
+
+          if ( ampScale > 0.001 ) {
+            vec2 d0 = normalize( mix( flowDir, windDir, 0.38 ) );
+            vec2 d1 = normalize( vec2( 0.76, -0.65 ) + windDir * 0.25 );
+            vec2 d2 = normalize( vec2( -0.58, 0.81 ) + flowDir * 0.20 );
+            vec2 d3 = normalize( vec2( -0.86, -0.51 ) );
+
+            addGerstnerWave( pos.xz, d0, 5.6, 0.24, 0.017 * ampScale, 0.56, uTime, disp, tangent, binormal );
+            addGerstnerWave( pos.xz, d1, 3.5, 0.22, 0.011 * ampScale, 0.68, uTime, disp, tangent, binormal );
+            addGerstnerWave( pos.xz, d2, 2.2, 0.18, 0.0075 * ampScale, 0.82, uTime, disp, tangent, binormal );
+            addGerstnerWave( pos.xz, d3, 1.35, 0.14, 0.0045 * ampScale, 0.96, uTime, disp, tangent, binormal );
+          }
+
+          pos += disp;
+
+          // Right-handed analytical Gerstner normal (binormal x tangent points +Y)
+          vec3 gNorm = normalize( cross( binormal, tangent ) );
+          vGerstnerSlope = -gNorm.xz / max( gNorm.y, 0.28 );
+          vWaveCrest = clamp( disp.y / max( 0.032 * windGain, 0.01 ), 0.0, 1.0 ) * deepMask;
 
           vec4 worldPos = modelMatrix * vec4( pos, 1.0 );
           vWorldPos = worldPos.xyz;
@@ -280,6 +359,10 @@ export class StreamWater {
         uniform float uRainIntensity;
         uniform float uWindSpeed;
         uniform vec2 uWindDir;
+        uniform vec3 uSwimmerPos;
+        uniform float uSwimmerSpeed;
+        uniform vec2 uSwimmerDir;
+        uniform float uSwimmerActive;
         uniform vec4 uImpactRipples[10];
         uniform vec3 uBridgePilings[8];
 
@@ -287,6 +370,8 @@ export class StreamWater {
         varying vec2 vUv;
         varying float vBedHeight;
         varying vec2 vFlowDir;
+        varying vec2 vGerstnerSlope;
+        varying float vWaveCrest;
 
         float hash21( vec2 p ) {
           vec3 p3 = fract( vec3( p.xyx ) * 0.1031 );
@@ -311,11 +396,12 @@ export class StreamWater {
           return mix( mix( a, b, u.x ), mix( c, d, u.x ), u.y );
         }
 
-        float fbm3( vec2 p ) {
+        // 4-octave rotated fBm for rich water surface micro-waves, reflections & foam detail
+        float fbm4( vec2 p ) {
           float sum = 0.0;
           float amp = 0.5;
           mat2 rot = mat2( 0.80, -0.60, 0.60, 0.80 );
-          for ( int i = 0; i < 3; i++ ) {
+          for ( int i = 0; i < 4; i++ ) {
             sum += amp * valueNoise( p );
             p = rot * p * 2.04 + vec2( 11.7, 23.3 );
             amp *= 0.5;
@@ -323,39 +409,33 @@ export class StreamWater {
           return sum;
         }
 
-        // Dual-scrolling downstream ripple field in stream-aligned (u, v) space
+        // Animated 4-octave dual-scrolling capillary & current wave field in stream-aligned space
         float streamWaveHeight( vec2 suv, float t ) {
-          // Layer 1: primary downstream current undulations with gentle domain warp
           vec2 warp = vec2(
             valueNoise( suv * vec2( 2.2, 1.6 ) - vec2( 0.0, t * 0.45 ) ) - 0.5,
             valueNoise( suv * vec2( 2.2, 1.6 ) + vec2( 7.3, -t * 0.52 ) ) - 0.5
-          ) * 0.45;
+          ) * 0.44;
 
-          vec2 p1 = ( suv + warp ) * vec2( 3.2, 2.1 ) - vec2( 0.04 * t, t * 0.88 );
-          float w1 = valueNoise( p1 ) * 0.55 + valueNoise( p1 * 2.18 + vec2( 4.1, -t * 0.42 ) ) * 0.28;
+          vec2 p1 = ( suv + warp ) * vec2( 2.9, 2.0 ) - vec2( 0.05 * t, t * 0.82 );
+          float w1 = fbm4( p1 );
 
-          // Layer 2: counter-angled fine capillary ripples flowing slightly faster
-          mat2 r2 = mat2( 0.92, -0.39, 0.39, 0.92 );
-          vec2 p2 = r2 * ( suv * vec2( 5.4, 4.2 ) ) - vec2( -0.11 * t, t * 1.42 );
-          float w2 = valueNoise( p2 ) * 0.48 + valueNoise( p2 * 2.35 + vec2( -5.4, -t * 0.72 ) ) * 0.24;
+          mat2 r2 = mat2( 0.90, -0.43, 0.43, 0.90 );
+          vec2 p2 = r2 * ( suv * vec2( 4.8, 3.8 ) ) - vec2( -0.14 * t, t * 1.32 );
+          float w2 = fbm4( p2 );
 
-          // Layer 3: micro sparkle facet detail
-          vec2 p3 = suv * vec2( 9.5, 8.2 ) - vec2( 0.08 * t, t * 2.1 );
-          float w3 = valueNoise( p3 ) * 0.16;
-
-          return ( w1 + w2 ) * 0.48 + w3;
+          return w1 * 0.58 + w2 * 0.42;
         }
 
-        // Cross-wind capillary chop driven by windSystem direction & speed
+        // 4-octave cross-wind capillary chop driven by wind direction & speed
         float windChopHeight( vec2 worldXZ, float t, vec2 wDir, float wSpeed ) {
           vec2 wPerp = vec2( -wDir.y, wDir.x );
           float along = dot( worldXZ, wDir );
           float across = dot( worldXZ, wPerp );
-          float speed = 1.6 + wSpeed * 2.4;
+          float speed = 1.45 + wSpeed * 2.25;
 
-          float c1 = valueNoise( vec2( along * 1.45 - t * speed, across * 2.4 ) );
-          float c2 = valueNoise( vec2( along * 3.6 - t * ( speed * 1.45 ), across * 4.8 + c1 * 1.6 ) );
-          return ( c1 * 0.62 + c2 * 0.38 );
+          vec2 wp1 = vec2( along * 1.15 - t * speed, across * 1.85 );
+          vec2 wp2 = vec2( along * 2.75 - t * ( speed * 1.42 ), across * 3.6 + 6.3 );
+          return fbm4( wp1 ) * 0.62 + valueNoise( wp2 ) * 0.38;
         }
 
         // Concentric expanding raindrop ripple rings in world XZ
@@ -385,23 +465,68 @@ export class StreamWater {
           return accum;
         }
 
-        // Flowing dual-harmonic shallow riverbed pebble caustic interference pattern
-        float computeCaustics( vec2 suv, float t ) {
-          vec2 p1 = suv * vec2( 4.8, 4.0 ) - vec2( 0.0, t * 0.82 );
-          vec2 p2 = suv * vec2( 6.4, 5.4 ) - vec2( t * 0.14, t * 1.08 );
-          float n1 = sin( p1.x * 3.25 + sin( p1.y * 2.75 + t * 1.15 ) );
-          float n2 = cos( p2.y * 3.55 + sin( p2.x * 3.15 - t * 1.35 ) );
-          float web = 1.0 - abs( n1 + n2 ) * 0.5;
-          float mainCaustic = pow( clamp( web, 0.0, 1.0 ), 3.8 );
+        // Crisp Voronoi cellular filament caustic layer using F2 - F1 ridge distance
+        float voronoiCausticLayer( vec2 p, float t ) {
+          vec2 n = floor( p );
+          vec2 f = fract( p );
+          float d1 = 8.0;
+          float d2 = 8.0;
 
-          // Crisp high-frequency shimmer filaments dancing across shallow river pebbles
-          vec2 p3 = suv * vec2( 9.8, 8.6 ) - vec2( -t * 0.18, t * 1.55 );
-          float f1 = sin( p3.x * 2.9 + cos( p3.y * 2.6 + t * 1.65 ) );
-          float f2 = cos( p3.y * 3.2 - sin( p3.x * 2.8 - t * 1.45 ) );
-          float fineWeb = 1.0 - abs( f1 + f2 ) * 0.5;
-          float shimmerSparkle = pow( clamp( fineWeb, 0.0, 1.0 ), 5.2 ) * 0.65;
+          for ( int j = -1; j <= 1; j++ ) {
+            for ( int i = -1; i <= 1; i++ ) {
+              vec2 g = vec2( float( i ), float( j ) );
+              vec2 o = hash22( n + g );
+              o = 0.5 + 0.42 * sin( t * 1.2 + 6.2831853 * o );
+              vec2 r = g + o - f;
+              float d = dot( r, r );
+              if ( d < d1 ) {
+                d2 = d1;
+                d1 = d;
+              } else if ( d < d2 ) {
+                d2 = d;
+              }
+            }
+          }
 
-          return mainCaustic + shimmerSparkle;
+          float edgeDist = sqrt( d2 ) - sqrt( d1 );
+          return pow( clamp( 1.0 - smoothstep( 0.0, 0.34, edgeDist ), 0.0, 1.0 ), 2.6 );
+        }
+
+        // Dual-layer counter-drifting animated Voronoi riverbed caustics
+        float computeVoronoiCaustics( vec2 suv, float t ) {
+          vec2 p1 = suv * vec2( 2.85, 2.45 ) - vec2( 0.04 * t, t * 0.46 );
+          mat2 rot = mat2( 0.84, -0.54, 0.54, 0.84 );
+          vec2 p2 = rot * ( suv * vec2( 4.15, 3.65 ) ) - vec2( -0.11 * t, t * 0.68 );
+
+          float c1 = voronoiCausticLayer( p1, t * 0.95 );
+          float c2 = voronoiCausticLayer( p2, t * 1.28 + 2.35 );
+          return clamp( c1 * 0.62 + c2 * 0.48 + c1 * c2 * 0.88, 0.0, 1.75 );
+        }
+
+        // Lightweight reflected drifted-cloud lookup in sky reflection direction R
+        vec3 sampleSkyAndClouds( vec3 dir, vec3 sunDir, vec2 wDir, float t ) {
+          float up = clamp( dir.y, 0.0, 1.0 );
+          float skyGrad = pow( up, 0.52 );
+          vec3 skyCol = mix( uSkyHorizonColor, uSkyZenithColor, skyGrad );
+
+          if ( dir.y > 0.02 ) {
+            vec2 cUv = dir.xz / ( dir.y + 0.18 );
+            vec2 drift = wDir * ( t * ( 0.018 + uWindSpeed * 0.014 ) );
+            float cField = fbm4( cUv * 0.46 + drift );
+            float cMask = smoothstep( 0.44 - uRainIntensity * 0.16, 0.78 - uRainIntensity * 0.10, cField )
+                        * smoothstep( 0.02, 0.22, dir.y );
+
+            float sunAlign = pow( max( dot( dir, sunDir ), 0.0 ), 6.0 );
+            vec3 brightCloud = mix( vec3( 0.88, 0.92, 0.98 ), uSunColor * 1.08, 0.42 )
+                             * ( 0.35 + uSunIntensity * 0.72 );
+            brightCloud += uSunColor * sunAlign * 0.42 * ( 1.0 - uRainIntensity * 0.8 );
+            vec3 rainCloud = uSkyHorizonColor * 0.62;
+            vec3 cloudCol = mix( brightCloud, rainCloud, uRainIntensity * 0.85 );
+
+            skyCol = mix( skyCol, cloudCol, cMask * 0.74 );
+          }
+
+          return skyCol;
         }
 
         void main() {
@@ -415,8 +540,11 @@ export class StreamWater {
 
           vec2 flowDir = normalize( vFlowDir );
           vec2 rightDir = vec2( flowDir.y, -flowDir.x );
+          vec2 wDir = normalize( uWindDir + vec2( 1e-5, 0.0 ) );
+          float wScale = clamp( uWindSpeed, 0.0, 3.2 );
+          float lagoonFetch = 1.0 + smoothstep( 0.75, 2.75, depth ) * 0.45;
 
-          // Finite-difference gradient of dual-scrolling downstream waves
+          // Finite-difference gradient of 4-octave dual-scrolling animated waves
           float eps = 0.032;
           float hC = streamWaveHeight( vUv, uTime );
           float hU = streamWaveHeight( vUv + vec2( eps, 0.0 ), uTime );
@@ -425,19 +553,17 @@ export class StreamWater {
           float dU = ( hU - hC ) / eps;
           float dV = ( hV - hC ) / eps;
 
-          // Subtle stronger chop over shallow riffles
-          float shallowRiffle = 1.0 + ( 1.0 - smoothstep( 0.05, 0.48, depth ) ) * 0.45;
-          float streamBump = 0.068 * shallowRiffle;
-          vec2 worldSlope = ( rightDir * dU + flowDir * dV ) * streamBump;
+          // Subtle stronger chop over shallow riffles + rolling lagoon fetch
+          float shallowRiffle = 1.0 + ( 1.0 - smoothstep( 0.05, 0.52, depth ) ) * 0.42;
+          float streamBump = 0.072 * shallowRiffle * ( 0.88 + 0.12 * lagoonFetch );
+          vec2 worldSlope = vGerstnerSlope * 0.95 + ( rightDir * dU + flowDir * dV ) * streamBump;
 
-          // Cross-wind chop perturbation
-          vec2 wDir = normalize( uWindDir + vec2( 1e-5, 0.0 ) );
-          float wScale = clamp( uWindSpeed, 0.0, 3.2 );
-          float wEps = 0.09;
+          // Cross-wind 4-octave capillary chop perturbation scaling with uWindSpeed & lagoon fetch
+          float wEps = 0.085;
           float wcC = windChopHeight( vWorldPos.xz, uTime, wDir, wScale );
           float wcX = windChopHeight( vWorldPos.xz + vec2( wEps, 0.0 ), uTime, wDir, wScale );
           float wcZ = windChopHeight( vWorldPos.xz + vec2( 0.0, wEps ), uTime, wDir, wScale );
-          float windAmp = ( 0.022 + wScale * 0.038 ) * smoothstep( 0.02, 0.24, depth );
+          float windAmp = ( 0.024 + wScale * 0.042 ) * lagoonFetch * smoothstep( 0.02, 0.24, depth );
           worldSlope += vec2( ( wcX - wcC ) / wEps, ( wcZ - wcC ) / wEps ) * windAmp;
 
           // Concentric raindrop impact ripples when raining
@@ -453,7 +579,7 @@ export class StreamWater {
             worldSlope += vec2( ( rX - rC ) / rEps, ( rZ - rC ) / rEps ) * rainBump;
           }
 
-          // Dynamic expanding concentric impact ripples (wading, running, jumping, slipping)
+          // Dynamic expanding concentric impact ripples (wading, running, jumping, diving, slipping)
           float impactFoam = 0.0;
           float rippleDepthMask = smoothstep( 0.01, 0.10, depth );
           for ( int i = 0; i < 10; i++ ) {
@@ -517,7 +643,7 @@ export class StreamWater {
                 // 1. Swirling white-water collar & upstream bow wave pile-up around piling timber
                 float ringDist = max( pDist - rPad, 0.0 );
                 float angleP = atan( across, along );
-                float bowBias = smoothstep( 0.28, -0.78, along * invDist );
+                float bowBias = 1.0 - smoothstep( -0.78, 0.28, along * invDist );
                 float swirlPulse = sin( angleP * 4.0 - uTime * 3.6 + ringDist * 11.0 ) * 0.5 + 0.5;
                 float collarWidth = 0.24 + rPad * 0.42 + bowBias * 0.22;
                 float collarRing = exp( -( ringDist * ringDist ) / max( collarWidth * collarWidth, 0.02 ) )
@@ -556,94 +682,234 @@ export class StreamWater {
             }
           }
 
+          // Live swimmer frothy wake collar, treading rings & trailing Kelvin V-wake ripples
+          float swimmerFoam = 0.0;
+          float swimPresence = max( uSwimmerActive, smoothstep( 0.05, 0.25, uSwimmerSpeed ) );
+          if ( swimPresence > 0.005 ) {
+            vec2 relS = vWorldPos.xz - uSwimmerPos.xz;
+            float sDist = length( relS );
+            if ( sDist < 7.5 ) {
+              float sSpeedNorm = clamp( uSwimmerSpeed / 3.6, 0.0, 1.35 );
+              vec2 sDir = normalize( uSwimmerDir + vec2( 0.0, 1e-5 ) );
+              vec2 sRight = vec2( sDir.y, -sDir.x );
+              float invSDist = 1.0 / max( sDist, 0.001 );
+
+              // 1. Frothy white swimmer torso collar & concentric treading ripples
+              float collarRadius = 0.40 + sSpeedNorm * 0.14;
+              float collarDelta = sDist - collarRadius;
+              float collarBand = 0.26 + sSpeedNorm * 0.12;
+              float collarPulse = sin( sDist * 16.0 - uTime * ( 5.5 + sSpeedNorm * 3.5 ) ) * 0.5 + 0.5;
+              float collarFroth = exp( -( collarDelta * collarDelta ) / ( collarBand * collarBand ) )
+                                * ( 0.62 + 0.38 * collarPulse ) * ( 0.72 + sSpeedNorm * 0.55 );
+
+              // Outward radiating concentric treading ripples
+              float ringWave = sin( sDist * 13.5 - uTime * ( 5.8 + sSpeedNorm * 2.8 ) );
+              float ringEnv = exp( -sDist * 0.82 ) * smoothstep( 0.18, 0.48, sDist );
+              worldSlope += ( relS * invSDist ) * ( ringWave * ringEnv * ( 0.20 + sSpeedNorm * 0.22 ) * swimPresence );
+              swimmerFoam += max( ringWave, 0.0 ) * ringEnv * ( 0.28 + sSpeedNorm * 0.26 );
+
+              // 2. Trailing Kelvin V-wake arms & bubbly flutter-kick trail behind swimmer
+              float moveMask = smoothstep( 0.12, 0.95, uSwimmerSpeed );
+              if ( moveMask > 0.005 ) {
+                float behind = dot( relS, -sDir );
+                float side = dot( relS, sRight );
+                if ( behind > -0.35 && behind < 6.8 ) {
+                  float bPos = max( behind + 0.15, 0.0 );
+                  float wakeSpread = 0.36 + bPos * 0.43;
+                  float absSide = abs( side );
+                  float armDist = abs( absSide - wakeSpread );
+                  float armW = 0.15 + bPos * 0.095;
+                  float armEnv = exp( -( armDist * armDist ) / max( armW * armW, 0.02 ) );
+                  float bFade = smoothstep( 0.0, 0.32, bPos ) * ( 1.0 - smoothstep( 2.2, 6.4, bPos ) );
+                  float armNoise = valueNoise( vec2( armDist * 4.8, bPos * 3.2 - uTime * 4.4 ) );
+
+                  float wakeArmFoam = armEnv * bFade * ( 0.55 + 0.55 * armNoise ) * ( 0.65 + sSpeedNorm * 0.60 );
+                  float sSign = side >= 0.0 ? 1.0 : -1.0;
+                  float wakeRidge = sin( ( absSide - wakeSpread ) * 11.0 - uTime * 5.2 ) * armEnv * bFade;
+                  worldSlope += sRight * ( sSign * wakeRidge * ( 0.22 + sSpeedNorm * 0.20 ) * moveMask );
+
+                  // Churning central kick froth directly behind the swimmer
+                  float kickW = 0.32 + bPos * 0.18;
+                  float kickEnv = exp( -( side * side ) / max( kickW * kickW, 0.04 ) );
+                  float kickFade = smoothstep( 0.0, 0.16, bPos ) * ( 1.0 - smoothstep( 1.2, 3.9, bPos ) );
+                  float kickChurn = valueNoise( vec2( side * 5.2, bPos * 4.6 - uTime * 6.5 ) );
+                  float kickFoam = kickEnv * kickFade * ( 0.45 + 0.65 * kickChurn ) * ( 0.65 + sSpeedNorm * 0.55 );
+
+                  swimmerFoam += ( wakeArmFoam + kickFoam ) * moveMask;
+                }
+              }
+
+              swimmerFoam = ( swimmerFoam + collarFroth ) * swimPresence * rippleDepthMask;
+            }
+          }
+
           vec3 N = normalize( vec3( -worldSlope.x, 1.0, -worldSlope.y ) );
           vec3 V = normalize( cameraPosition - vWorldPos );
           vec3 L = normalize( uSunDir );
+          float dist = length( cameraPosition - vWorldPos );
 
+          // ------------------------------------------------------------------
+          // UNDERWATER BRANCH: Looking UP from below water surface (!gl_FrontFacing)
+          // Renders physical Snell's Window, rippling sky/sun refraction & TIR mirror
+          // ------------------------------------------------------------------
+          if ( !gl_FrontFacing ) {
+            vec3 Nunder = -N;
+            float cosUnder = clamp( dot( Nunder, V ), 0.0, 1.0 );
+
+            // Critical angle for water->air (~48.6 deg, cos ~ 0.661) perturbed by animated wave ripples
+            float snellWindow = smoothstep( 0.55, 0.72, cosUnder );
+            float rimRing = exp( -pow( ( cosUnder - 0.64 ) / 0.055, 2.0 ) );
+
+            // Refracted sky & drifting clouds visible through Snell's window
+            vec3 refrDir = normalize( mix( vec3( 0.0, 1.0, 0.0 ), normalize( -V + N * 0.45 ), 0.65 ) );
+            refrDir.y = max( refrDir.y, 0.06 );
+            vec3 aboveSky = sampleSkyAndClouds( refrDir, L, wDir, uTime );
+
+            // Blazing refracted solar disc & shimmering caustic glints overhead
+            float sunRefract = pow( max( dot( refrDir, L ), 0.0 ), 36.0 ) * 1.45
+                             + pow( max( dot( refrDir, L ), 0.0 ), 240.0 ) * 2.8;
+            float sunElevVis = smoothstep( -0.02, 0.16, L.y ) * ( 1.0 - uRainIntensity * 0.72 );
+            vec3 windowColor = aboveSky * ( 0.82 + 0.35 * uSunIntensity )
+                             + uSunColor * sunRefract * ( 0.35 + uSunIntensity * 1.15 ) * sunElevVis;
+
+            // Outside Snell's Window: Total Internal Reflection silvery-emerald liquid mirror
+            vec3 tirDeepCol = vec3( 0.015, 0.11, 0.14 ) * ( 0.45 + uSunIntensity * 0.85 );
+            float underCaust = computeVoronoiCaustics( vUv + N.xz * 0.24, uTime );
+            vec3 tirColor = tirDeepCol
+                          + vec3( 0.10, 0.38, 0.40 ) * underCaust * ( 0.25 + uSunIntensity * 0.55 )
+                          + uSkyHorizonColor * 0.14 * ( 1.0 - cosUnder );
+
+            // Chromatic cyan-gold dispersion sparkle along Snell's critical ring
+            vec3 rimDispersion = vec3( 0.35, 0.88, 0.96 ) * rimRing * ( 0.28 + uSunIntensity * 0.45 );
+
+            vec3 underColor = mix( tirColor, windowColor, snellWindow ) + rimDispersion;
+
+            // Subtle foam shadows visible from underneath (shoreline / swimmer / pilings)
+            float underFoam = clamp( impactFoam * 0.55 + pilingFoam * 0.55 + swimmerFoam * 0.72, 0.0, 0.85 );
+            vec3 foamUnderCol = mix( vec3( 0.38, 0.62, 0.66 ), uSunColor * 0.72, 0.35 );
+            underColor = mix( underColor, foamUnderCol, underFoam * 0.55 );
+
+            // Underwater blue-emerald distance attenuation (replaces dry air fog underwater)
+            vec3 underwaterFogCol = vec3( 0.012, 0.085, 0.115 ) * ( 0.35 + uSunIntensity * 0.95 );
+            float underFog = 1.0 - exp( -dist * 0.115 );
+            underColor = mix( underColor, underwaterFogCol, clamp( underFog, 0.0, 0.94 ) );
+
+            float underAlpha = clamp( mix( 0.88, 0.72, snellWindow ) + underFoam * 0.14, 0.62, 0.96 ) * edgeAlpha;
+            gl_FragColor = vec4( underColor, underAlpha );
+
+            #include <tonemapping_fragment>
+            #include <colorspace_fragment>
+            return;
+          }
+
+          // ------------------------------------------------------------------
+          // SURFACE BRANCH: Looking DOWN at stream & deep swimming lagoon
+          // ------------------------------------------------------------------
           // Schlick Fresnel reflection (F0 = 0.02)
           float NdotV = max( dot( N, V ), 0.0 );
           float fresnel = 0.02 + 0.98 * pow( max( 1.0 - NdotV, 0.0 ), 5.0 );
 
-          // Reflected sky gradient with forest-canopy reflection tint near low grazing angles
+          // Crisp reflected sky & drifted clouds with forest-canopy tint near tight stream banks
           vec3 R = reflect( -V, N );
-          float skyGrad = pow( clamp( R.y, 0.0, 1.0 ), 0.55 );
-          vec3 skyRefl = mix( uSkyHorizonColor, uSkyZenithColor, skyGrad );
+          vec3 skyCloudRefl = sampleSkyAndClouds( R, L, wDir, uTime );
           float canopyDarken = smoothstep( 0.02, 0.36, R.y );
-          vec3 canopyTint = mix( uSkyHorizonColor * vec3( 0.18, 0.28, 0.20 ), skyRefl, canopyDarken );
-          vec3 reflectionColor = mix( canopyTint, skyRefl, 0.52 ) * 0.85;
+          float openLagoonFactor = smoothstep( 0.85, 2.5, depth );
+          vec3 canopyTint = mix( uSkyHorizonColor * vec3( 0.18, 0.28, 0.20 ), skyCloudRefl, canopyDarken );
+          vec3 reflectionColor = mix( canopyTint, skyCloudRefl, mix( 0.54, 0.82, openLagoonFactor ) ) * 0.92;
 
-          // Crisp dual-lobe specular sun/moon glints
+          // Crisp dual-lobe specular sun/moon sparkles
           vec3 H = normalize( L + V + vec3( 0.0, 1e-5, 0.0 ) );
           float NdotH = max( dot( N, H ), 0.0 );
           float rainSpecDamp = mix( 1.0, 0.32, uRainIntensity );
-          float specSharp = pow( NdotH, 340.0 ) * 2.65;
-          float specBroad = pow( NdotH, 46.0 ) * 0.20;
-          float grazingBoost = mix( 0.65, 1.35, pow( max( 1.0 - NdotV, 0.0 ), 2.0 ) );
+          float specSharp = pow( NdotH, 420.0 ) * 3.15;
+          float specBroad = pow( NdotH, 52.0 ) * 0.22;
+          float grazingBoost = mix( 0.68, 1.40, pow( max( 1.0 - NdotV, 0.0 ), 2.0 ) );
           float lightElevFade = smoothstep( -0.02, 0.16, L.y );
-          vec3 specular = uSunColor * ( specSharp + specBroad ) * ( 0.26 + uSunIntensity * 1.15 )
+          vec3 specular = uSunColor * ( specSharp + specBroad ) * ( 0.26 + uSunIntensity * 1.22 )
                         * rainSpecDamp * grazingBoost * lightElevFade;
 
-          // Exponential depth color absorption (warm crystal-emerald shallows -> deep forest teal)
-          vec3 absorption = exp( -depth * vec3( 0.54, 0.20, 0.13 ) );
-          vec3 shallowTint = vec3( 0.16, 0.35, 0.24 );
-          vec3 deepTint = vec3( 0.010, 0.052, 0.068 );
-          vec3 waterScatter = mix( deepTint, shallowTint, clamp( absorption.g, 0.0, 1.0 ) );
+          // Physically inspired Beer-Lambert depth absorption:
+          // Crystal-clear sunlit turquoise over shallow river pebbles (< 0.85m)
+          // -> lush vibrant aquamarine -> deep emerald-sapphire across the 3.25m swimming lagoon!
+          vec3 absorption = exp( -depth * vec3( 0.54, 0.16, 0.085 ) );
+          vec3 shallowTurquoise = vec3( 0.15, 0.46, 0.44 );
+          vec3 midEmerald = vec3( 0.028, 0.21, 0.24 );
+          vec3 deepSapphire = vec3( 0.007, 0.052, 0.118 );
 
-          // Harmonize water body brightness cleanly between sunlit emerald day & moody moonlit night
+          float shallowBand = smoothstep( 0.28, 0.88, absorption.r );
+          float midBand = smoothstep( 0.16, 0.62, absorption.r );
+          vec3 waterScatter = mix( deepSapphire, midEmerald, midBand );
+          waterScatter = mix( waterScatter, shallowTurquoise, shallowBand );
+
+          // Subsurface emerald-turquoise forward scatter glow through deep sunlit lagoon waves
+          float sssAngle = pow( clamp( dot( -L, V ) * 0.5 + 0.5, 0.0, 1.0 ), 2.2 );
+          float sssMask = smoothstep( 0.30, 2.2, depth ) * ( 0.22 + uSunIntensity * 0.85 ) * ( 1.0 - uRainIntensity * 0.65 );
+          waterScatter += vec3( 0.018, 0.15, 0.17 ) * sssAngle * sssMask * absorption.g * 0.58;
+
+          // Harmonize water body brightness cleanly between sunlit emerald-turquoise day & moonlit night
           float skyLuma = dot( uSkyHorizonColor, vec3( 0.299, 0.587, 0.114 ) );
-          vec3 irradiance = uSkyHorizonColor * 0.34 + uSkyZenithColor * 0.20
-                          + uSunColor * max( L.y, 0.04 ) * ( 0.06 + uSunIntensity * 0.52 );
-          vec3 bodyColor = waterScatter * irradiance * mix( 0.65, 1.18, clamp( skyLuma * 2.2, 0.0, 1.0 ) );
+          vec3 irradiance = uSkyHorizonColor * 0.34 + uSkyZenithColor * 0.22
+                          + uSunColor * max( L.y, 0.04 ) * ( 0.06 + uSunIntensity * 0.56 );
+          vec3 bodyColor = waterScatter * irradiance * mix( 0.66, 1.22, clamp( skyLuma * 2.2, 0.0, 1.0 ) );
 
-          // High-clarity projected shallow riverbed pebble caustics (depth < 0.78)
-          vec2 refractedUv = vUv - vec2( dot( N.xz, rightDir ), dot( N.xz, flowDir ) ) * min( depth, 0.9 ) * 0.18;
-          float caustics = computeCaustics( refractedUv, uTime );
-          float shallowDepthZone = smoothstep( 0.025, 0.13, depth ) * ( 1.0 - smoothstep( 0.52, 0.78, depth ) );
-          float causticMask = shallowDepthZone * exp( -depth * 1.05 )
-                            + smoothstep( 0.14, 0.42, depth ) * exp( -depth * 2.15 ) * 0.22;
-          float dayCausticVis = smoothstep( 0.08, 0.58, uSunIntensity ) * ( 1.0 - uRainIntensity * 0.64 );
-          vec3 causticLight = uSunColor * vec3( 0.80, 1.0, 0.88 ) * caustics * causticMask
-                            * absorption * dayCausticVis * 0.86;
+          // Dual-layer animated Voronoi riverbed caustics:
+          // Crisp & luminous over shallow river pebbles (< 0.85m), fading softly into deep lagoon waters
+          vec2 refractedUv = vUv - vec2( dot( N.xz, rightDir ), dot( N.xz, flowDir ) ) * min( depth, 1.4 ) * 0.18;
+          float caustics = computeVoronoiCaustics( refractedUv, uTime );
+          float shallowCaustic = smoothstep( 0.02, 0.12, depth ) * ( 1.0 - smoothstep( 0.55, 0.92, depth ) );
+          float lagoonCaustic = smoothstep( 0.12, 0.55, depth ) * exp( -depth * 0.88 ) * 0.52;
+          float causticMask = shallowCaustic * exp( -depth * 0.72 ) + lagoonCaustic;
+          float dayCausticVis = smoothstep( 0.08, 0.56, uSunIntensity ) * ( 1.0 - uRainIntensity * 0.64 );
+          vec3 causticTint = mix( vec3( 0.78, 1.0, 0.94 ), vec3( 0.32, 0.82, 0.92 ), smoothstep( 0.75, 2.6, depth ) );
+          vec3 causticLight = uSunColor * causticTint * caustics * causticMask
+                            * absorption * dayCausticVis * 0.94;
           bodyColor += causticLight;
 
-          // Combine refracted stream body with Fresnel sky reflection + crisp specular & shallow caustic sparkle
-          float shallowReflFade = mix( 0.66, 0.90, smoothstep( 0.14, 0.78, depth ) );
-          vec3 waterColor = mix( bodyColor, reflectionColor, clamp( fresnel * shallowReflFade, 0.0, 0.90 ) )
+          // Combine refracted stream/lagoon body with Fresnel sky+cloud reflection + crisp specular & caustics
+          float shallowReflFade = mix( 0.62, 0.92, smoothstep( 0.16, 1.15, depth ) );
+          vec3 waterColor = mix( bodyColor, reflectionColor, clamp( fresnel * shallowReflFade, 0.0, 0.92 ) )
                           + specular
-                          + causticLight * 0.28;
+                          + causticLight * 0.26;
 
-          // Organic noise-broken shoreline foam where depth < 0.25 + subtle downstream riffle highlights
-          float foamMacro = fbm3( vUv * vec2( 2.8, 2.2 ) - vec2( 0.0, uTime * 0.36 ) );
-          float foamLace = fbm3( vUv * vec2( 8.5, 6.8 ) - vec2( 0.06 * uTime, uTime * 0.82 ) );
+          // Organic noise-broken shoreline foam where depth < 0.26 + riffles + subtle windy lagoon wave caps
+          float foamMacro = fbm4( vUv * vec2( 2.8, 2.2 ) - vec2( 0.0, uTime * 0.36 ) );
+          float foamLace = fbm4( vUv * vec2( 8.5, 6.8 ) - vec2( 0.06 * uTime, uTime * 0.82 ) );
           float foamFine = valueNoise( vUv * vec2( 18.0, 15.0 ) - vec2( -0.09 * uTime, uTime * 1.25 ) );
 
           // Break shore zone organically so foam forms delicate patchy wisps rather than a solid stripe
-          float wavyDepthLimit = 0.25 * ( 0.35 + foamMacro * 0.95 );
+          float wavyDepthLimit = 0.26 * ( 0.35 + foamMacro * 0.95 );
           float shoreZone = ( 1.0 - smoothstep( 0.02, max( wavyDepthLimit, 0.05 ), depth ) )
                           * smoothstep( 0.008, 0.055, depth );
           float frothMask = smoothstep( 0.44, 0.76, foamLace * 0.72 + foamFine * 0.42 ) * smoothstep( 0.36, 0.68, foamMacro );
           float foamEdge = shoreZone * frothMask * 0.75;
 
-          // Subtle downstream riffle crests over shallow-medium water
+          // Subtle downstream riffle crests + breezy lagoon Gerstner whitecap micro-froth
           float waveSteepness = length( worldSlope );
-          float riffleMask = smoothstep( 0.08, 0.24, depth ) * ( 1.0 - smoothstep( 0.26, 0.72, depth ) );
+          float riffleMask = smoothstep( 0.08, 0.24, depth ) * ( 1.0 - smoothstep( 0.28, 0.78, depth ) );
           float riffleFoam = smoothstep( 0.16, 0.36, waveSteepness ) * riffleMask * smoothstep( 0.48, 0.78, foamFine ) * 0.36;
+          float crestFoam = smoothstep( 0.62, 0.95, vWaveCrest ) * smoothstep( 1.2, 2.4, wScale )
+                          * smoothstep( 0.45, 0.78, foamLace ) * 0.32;
 
           float impactCrestFoam = clamp( impactFoam * ( 0.72 + foamFine * 0.38 ), 0.0, 0.86 );
           float pilingCrestFoam = clamp( pilingFoam * ( 0.64 + foamLace * 0.34 + foamFine * 0.28 ), 0.0, 0.94 );
-          float foamAmount = clamp( foamEdge + riffleFoam + impactCrestFoam + pilingCrestFoam, 0.0, 0.93 );
-          vec3 foamAlbedo = vec3( 0.92, 0.95, 0.91 );
-          vec3 foamLit = foamAlbedo * ( uSkyHorizonColor * 0.44 + uSunColor * max( L.y, 0.06 ) * ( 0.10 + uSunIntensity * 0.58 ) );
+          float swimmerCrestFoam = clamp( swimmerFoam * ( 0.68 + foamLace * 0.32 + foamFine * 0.30 ), 0.0, 0.94 );
+          float foamAmount = clamp(
+            foamEdge + riffleFoam + crestFoam + impactCrestFoam + pilingCrestFoam + swimmerCrestFoam,
+            0.0,
+            0.95
+          );
+          vec3 foamAlbedo = vec3( 0.93, 0.96, 0.95 );
+          vec3 foamLit = foamAlbedo * ( uSkyHorizonColor * 0.44 + uSunColor * max( L.y, 0.06 ) * ( 0.10 + uSunIntensity * 0.60 ) );
           waterColor = mix( waterColor, foamLit, foamAmount );
 
-          // Physically inspired opacity: extra-clear sunlit shallows (< 0.78m) reveal pebbles & caustics -> rich deep teal
-          float shallowClarity = mix( 0.74, 1.0, smoothstep( 0.16, 0.78, depth ) );
-          float depthAlpha = ( 1.0 - exp( -depth * 1.62 ) ) * shallowClarity;
-          float causticBoostAlpha = clamp( caustics * causticMask * dayCausticVis * 0.22, 0.0, 0.24 );
-          float alpha = clamp( max( depthAlpha + causticBoostAlpha, max( fresnel * 0.82, foamAmount * 0.90 ) ), 0.0, 0.96 ) * edgeAlpha;
+          // Physically inspired opacity:
+          // Crystal-clear sunlit shallows (< 0.85m) reveal pebbles & Voronoi caustics -> lush deep sapphire lagoon
+          float shallowClarity = mix( 0.68, 1.0, smoothstep( 0.14, 0.95, depth ) );
+          float depthAlpha = ( 1.0 - exp( -depth * 1.28 ) ) * shallowClarity;
+          float causticBoostAlpha = clamp( caustics * causticMask * dayCausticVis * 0.20, 0.0, 0.24 );
+          float alpha = clamp( max( depthAlpha + causticBoostAlpha, max( fresnel * 0.84, foamAmount * 0.92 ) ), 0.0, 0.97 ) * edgeAlpha;
 
           // Match Three.js FogExp2 atmospheric distance fog
-          float dist = length( cameraPosition - vWorldPos );
           float fogFactor = 1.0 - exp( -uFogDensity * uFogDensity * dist * dist );
           waterColor = mix( waterColor, uFogColor, clamp( fogFactor, 0.0, 1.0 ) );
 
@@ -809,6 +1075,58 @@ export class StreamWater {
       }
       slot.set(9999, 9999, 0);
     }
+  }
+
+  /**
+   * Updates live swimmer wake shader uniforms (`uSwimmerPos`, `uSwimmerSpeed`, `uSwimmerDir`,
+   * `uSwimmerActive`) for frothy torso wake collar, treading rings & trailing Kelvin V-wake ripples.
+   */
+  setSwimmerState(pos, speed = 0.0, isSwimming = false) {
+    const active = Boolean(isSwimming) && Boolean(pos);
+    this._swimmerIsSwimming = active;
+
+    if (!active) {
+      this.uniforms.uSwimmerSpeed.value = 0.0;
+      this.uniforms.uSwimmerActive.value = 0.0;
+      this._hasPrevSwimmer = false;
+      return;
+    }
+
+    const px = Array.isArray(pos) ? Number(pos[0]) : Number(pos.x);
+    const py = Array.isArray(pos) ? Number(pos[1] ?? 0) : Number(pos.y ?? 0);
+    const pz = Array.isArray(pos) ? Number(pos[2]) : Number(pos.z);
+
+    if (!Number.isFinite(px) || !Number.isFinite(pz)) {
+      this.uniforms.uSwimmerSpeed.value = 0.0;
+      this.uniforms.uSwimmerActive.value = 0.0;
+      return;
+    }
+
+    if (this._hasPrevSwimmer) {
+      const dx = px - this._prevSwimmerPos.x;
+      const dz = pz - this._prevSwimmerPos.z;
+      const moveLen = Math.hypot(dx, dz);
+      if (moveLen > 0.002 && moveLen < 12.0) {
+        const dirU = this.uniforms.uSwimmerDir.value;
+        const nx = dx / moveLen;
+        const nz = dz / moveLen;
+        const blend = clamp(moveLen * 2.4, 0.12, 0.55);
+        dirU.set(lerp(dirU.x, nx, blend), lerp(dirU.y, nz, blend));
+        const dLen = Math.hypot(dirU.x, dirU.y);
+        if (dLen > 1e-4) {
+          dirU.multiplyScalar(1.0 / dLen);
+        }
+      }
+    } else if (this.terrain?.getStreamFlowDir) {
+      this.terrain.getStreamFlowDir(pz, this.uniforms.uSwimmerDir.value);
+    }
+
+    this._prevSwimmerPos.set(px, Number.isFinite(py) ? py : 0.0, pz);
+    this._hasPrevSwimmer = true;
+
+    this.uniforms.uSwimmerPos.value.set(px, Number.isFinite(py) ? py : 0.0, pz);
+    this.uniforms.uSwimmerSpeed.value = clamp(Number.isFinite(speed) ? speed : 0.0, 0.0, 12.0);
+    this.uniforms.uSwimmerActive.value = 1.0;
   }
 
   /**

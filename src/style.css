@@ -179,7 +179,7 @@ body {
 /* Bottom-Center Stack (Reaction Badge + Auto-Hiding Stamina Bar + Prompt) */
 .hud-bottom-center {
   position: absolute;
-  bottom: 18px;
+  bottom: 62px;
   left: 50%;
   transform: translateX(-50%);
   display: flex;
@@ -556,7 +556,41 @@ body {
   transition: width 240ms ease;
 }
 
-@media (max-width: 1120px) {
+/* Underwater teal-blue vignette & drifting caustic light-ray veil */
+.underwater-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 6;
+  opacity: 0;
+  background:
+    radial-gradient(ellipse at 50% 0%, rgba(72, 224, 232, 0.24) 0%, rgba(12, 86, 108, 0.34) 55%, rgba(4, 34, 48, 0.62) 100%),
+    repeating-linear-gradient(
+      115deg,
+      rgba(130, 245, 255, 0.08) 0px,
+      rgba(130, 245, 255, 0.08) 22px,
+      transparent 22px,
+      transparent 78px
+    );
+  mix-blend-mode: screen;
+  transition: opacity 280ms ease;
+}
+
+.underwater-overlay.active {
+  opacity: 1;
+  animation: underwaterCausticsDrift 6.5s ease-in-out infinite alternate;
+}
+
+@keyframes underwaterCausticsDrift {
+  0% {
+    background-position: 0 0, 0px 0px;
+  }
+  100% {
+    background-position: 0 0, 96px 42px;
+  }
+}
+
+@media (max-width: 1220px) {
   .keybind-legend {
     display: none;
   }
@@ -568,9 +602,9 @@ body.touch-ui-active .keybind-legend {
 }
 
 body.touch-ui-active .hud-dock {
-  top: 16px;
+  top: 78px;
   bottom: auto;
-  left: 196px;
+  left: 16px;
 }
 
 body.touch-ui-active .hud-dock #camera-toggle {
@@ -592,8 +626,8 @@ body.touch-ui-active .hud-bottom-center {
   }
 
   body.touch-ui-active .hud-dock {
-    top: 14px;
-    left: 174px;
+    top: 72px;
+    left: 16px;
   }
 
   body.touch-ui-active .volume-slider {

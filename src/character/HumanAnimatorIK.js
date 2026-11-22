@@ -54,12 +54,51 @@ class SpringDamper {
 }
 
 /**
- * Full procedural locomotion, emotional expression, secondary spring-damper physics,
- * and analytical 2-bone terrain-conforming Foot IK animator for HumanMeshBuilder.
+ * Emote definitions for playable character expressions.
+ */
+const EMOTE_DEFS = {
+  1: { id: 1, name: 'EmoteWave', duration: 2.6 },
+  2: { id: 2, name: 'EmoteWarmHands', duration: 3.6 },
+  3: { id: 3, name: 'EmoteCompass', duration: 3.2 },
+  4: { id: 4, name: 'EmoteVictory', duration: 3.4 },
+};
+
+const EMOTE_NAME_MAP = {
+  1: 1,
+  2: 2,
+  3: 3,
+  4: 4,
+  emotewave: 1,
+  wave: 1,
+  emotewarmhands: 2,
+  warmhands: 2,
+  warm: 2,
+  emotecompass: 3,
+  compass: 3,
+  emotevictory: 4,
+  victory: 4,
+};
+
+const PARANOID_LOOK_TABLE = [
+  { y: 0.68, p: 0.25 }, // sharp left
+  { y: -0.72, p: 0.28 }, // sharp right
+  { y: 0.05, p: 0.62 }, // straight down at boots
+  { y: -0.52, p: 0.48 }, // down-right grass
+  { y: 0.62, p: 0.44 }, // down-left grass
+  { y: 0.0, p: 0.58 }, // check boots again
+  { y: -0.66, p: 0.18 }, // sharp right behind shoulder
+];
+
+/**
+ * Full procedural locomotion, swimming/diving, playable emotes, emotional expression,
+ * secondary spring-damper physics, and analytical 2-bone terrain-conforming Foot IK
+ * animator for all character rigs.
  *
  * Supported states:
  *   'Idle', 'Walk', 'Jog', 'FullSprint', 'SkidStop', 'Jump', 'Crouch',
- *   'StreamWade', 'SlipRecovery', 'ThunderFlinch', 'RatPanicShake' (4 stages)
+ *   'StreamWade', 'SwimTread', 'SwimStroke', 'SwimSprint', 'SwimDive',
+ *   'EmoteWave', 'EmoteWarmHands', 'EmoteCompass', 'EmoteVictory',
+ *   'SlipRecovery', 'ThunderFlinch', 'RatPanicShake' (4 stages)
  */
 export class HumanAnimatorIK {
   constructor(humanRig, surfaceProvider = null) {
@@ -90,18 +129,21 @@ export class HumanAnimatorIK {
     // Current locomotion & state machine tracking
     this._stateName = 'Idle';
     this._stridePhase = 0;
+    this._swimPhase = 0;
     this._prevPhaseL = 0;
     this._prevPhaseR = Math.PI;
     this._wasGrounded = true;
+    this._wasSwimming = false;
     this._prevSpeed = 0;
     this._prevVertVel = 0;
     this._prevHipsY = this._hipBindY;
     this._prevHipsVelY = 0;
     this._skidLeadSide = 'L';
 
-    // Smooth Foot IK blend weights per leg (0 = pure FK airborne/shaking, 1 = full terrain IK)
+    // Smooth Foot IK & contact shadow blend weights (0 = airborne/swimming/shaking, 1 = full ground IK)
     this._ikWeightL = 1.0;
     this._ikWeightR = 1.0;
+    this._swimShadowWeight = 1.0;
     this._smoothedTerrainHipDrop = 0.0;
 
     // Expressive one-shot / multi-stage timers
@@ -110,6 +152,12 @@ export class HumanAnimatorIK {
 
     this._thunderTimer = -1;
     this._thunderDuration = 0.85;
+
+    // Playable character emote state (1..4)
+    this._emoteId = 0;
+    this._emoteName = null;
+    this._emoteTimer = -1;
+    this._emoteDuration = 0;
 
     // 4-Stage RatPanicShake state (0.0 .. 8.5s)
     this._panicActive = false;
@@ -198,6 +246,118 @@ export class HumanAnimatorIK {
       eyePitch: 0,
     };
 
+    // Pre-allocated per-frame scratch structs (zero GC churn per frame)
+    this._locScratch = {
+      speed: 0,
+      maxSprintSpeed: 7.5,
+      forwardSpeed: 0,
+      lateralSpeed: 0,
+      grounded: true,
+      verticalVel: 0,
+      crouching: false,
+      wading: false,
+      waterDepth: 0,
+      swimming: false,
+      swimMode: 'none',
+      submerged: false,
+      verticalSwimVel: 0,
+      skidding: false,
+      exhausted: false,
+      staminaRatio: 1.0,
+      turnRate: 0,
+      isSprinting: false,
+      panickedSprint: false,
+      windIntensity: 0,
+      headPitchOverride: null,
+      headYawOverride: null,
+    };
+
+    this._footstepPool = [
+      { side: 'L', intensity: 0 },
+      { side: 'R', intensity: 0 },
+      { side: 'L', intensity: 0 },
+      { side: 'R', intensity: 0 },
+    ];
+    this._pendingFootstepCount = 0;
+
+    this._leftFootScratch = { x: 0, z: 0, lift: 0, swing: 0, anklePitch: 0, toeBend: 0 };
+    this._rightFootScratch = { x: 0, z: 0, lift: 0, swing: 0, anklePitch: 0, toeBend: 0 };
+    this._strideScratch = {
+      isMoving: false,
+      panicSprinting: false,
+      speedRatio: 0,
+      strideLen: 1.44,
+      stanceDuty: 0.5,
+      stepHeight: 0,
+      stanceWidth: this._hipOffsetX,
+      phase: 0,
+      sinPhase: 0,
+      cosPhase: 1,
+      left: this._leftFootScratch,
+      right: this._rightFootScratch,
+    };
+
+    this._targetPoseScratch = { ...this._smooth };
+    this._panicLegScratch = {
+      side: 'R',
+      thighX: 0,
+      thighY: 0,
+      thighZ: 0,
+      shinX: 0,
+      ankleX: 0,
+      ankleZ: 0,
+    };
+    this._overlayScratch = {
+      hipsX: 0,
+      hipsY: 0,
+      hipsZ: 0,
+      hipsPitch: 0,
+      hipsYaw: 0,
+      hipsRoll: 0,
+      torsoPitch: 0,
+      torsoYaw: 0,
+      torsoRoll: 0,
+      neckPitch: 0,
+      neckYaw: 0,
+      headPitch: 0,
+      headYaw: 0,
+      headRoll: 0,
+      clavLShrug: 0,
+      clavRShrug: 0,
+      armOverrideWeight: 0,
+      armLPitch: 0,
+      armLRoll: 0,
+      armLYaw: 0,
+      forearmLPitch: 0,
+      wristLPitch: 0,
+      wristLRoll: 0,
+      fingerLCurl: 0,
+      armRPitch: 0,
+      armRRoll: 0,
+      armRYaw: 0,
+      forearmRPitch: 0,
+      wristRPitch: 0,
+      wristRRoll: 0,
+      fingerRCurl: 0,
+      shiverWrist: 0,
+      shiverForearm: 0,
+      shiverShoulder: 0,
+      shiverKnee: 0,
+      jawOpen: 0,
+      browHeight: 0,
+      browTilt: 0,
+      eyeWide: 0,
+      eyeSquint: 0,
+      eyeYaw: 0,
+      eyePitch: 0,
+      ikTargetL: 1.0,
+      ikTargetR: 1.0,
+      panicShakeLeg: null,
+      slipKick: 0,
+    };
+    this._fkLegLScratch = { thighX: 0, thighY: 0, thighZ: 0, shinX: 0, ankleX: 0, ankleY: 0, ankleZ: 0 };
+    this._fkLegRScratch = { thighX: 0, thighY: 0, thighZ: 0, shinX: 0, ankleX: 0, ankleY: 0, ankleZ: 0 };
+
     // Reusable scratch math objects (zero GC churn per frame)
     this._invRootMat = new THREE.Matrix4();
     this._rootQuat = new THREE.Quaternion();
@@ -246,7 +406,7 @@ export class HumanAnimatorIK {
   }
 
   // ---------------------------------------------------------------------------
-  // Public Event Triggers & Queries
+  // Public Event Triggers, Emotes & Queries
   // ---------------------------------------------------------------------------
 
   setSurfaceSolver(solver) {
@@ -259,6 +419,7 @@ export class HumanAnimatorIK {
 
   triggerSlip() {
     this._slipTimer = 0.0;
+    this.cancelEmote();
   }
 
   triggerThunderFlinch() {
@@ -273,6 +434,39 @@ export class HumanAnimatorIK {
     this._brushingPulse = false;
     this._prevSwipeSin = 0;
     this._prevHopSin = 0;
+    this.cancelEmote();
+  }
+
+  playEmote(id) {
+    if (this._panicActive || this._slipTimer >= 0) return false;
+    const key = typeof id === 'string' ? id.trim().toLowerCase() : String(id);
+    const resolvedId = EMOTE_NAME_MAP[key];
+    const def = resolvedId ? EMOTE_DEFS[resolvedId] : null;
+    if (!def) return false;
+
+    this._emoteId = def.id;
+    this._emoteName = def.name;
+    this._emoteTimer = 0.0;
+    this._emoteDuration = def.duration;
+    return true;
+  }
+
+  cancelEmote() {
+    this._emoteId = 0;
+    this._emoteName = null;
+    this._emoteTimer = -1;
+    this._emoteDuration = 0;
+  }
+
+  getActiveEmote() {
+    if (!this._emoteName || this._emoteTimer < 0) return null;
+    return {
+      id: this._emoteId,
+      name: this._emoteName,
+      timer: this._emoteTimer,
+      duration: this._emoteDuration,
+      progress: clamp(this._emoteTimer / Math.max(this._emoteDuration, 0.001), 0, 1),
+    };
   }
 
   getPanicInfo() {
@@ -291,6 +485,13 @@ export class HumanAnimatorIK {
 
   getFootPositions(leftOut = new THREE.Vector3(), rightOut = new THREE.Vector3()) {
     return this.rig.getFootWorldPositions(leftOut, rightOut);
+  }
+
+  _pushPendingFootstep(side, intensity) {
+    if (this._pendingFootstepCount >= this._footstepPool.length) return;
+    const slot = this._footstepPool[this._pendingFootstepCount++];
+    slot.side = side;
+    slot.intensity = intensity;
   }
 
   // ---------------------------------------------------------------------------
@@ -403,32 +604,47 @@ export class HumanAnimatorIK {
     const safeDt = clamp(Number.isFinite(dt) ? dt : 0.016, 0.0001, 0.05);
     const safeElapsed = Number.isFinite(elapsed) ? elapsed : 0;
 
-    // Sanitize locomotion state inputs
-    const loc = {
-      speed: Number.isFinite(locomotionState?.speed) ? Math.max(0, locomotionState.speed) : 0,
-      maxSprintSpeed:
-        Number.isFinite(locomotionState?.maxSprintSpeed) && locomotionState.maxSprintSpeed > 0.5
-          ? locomotionState.maxSprintSpeed
-          : 7.5,
-      forwardSpeed: Number.isFinite(locomotionState?.forwardSpeed) ? locomotionState.forwardSpeed : (locomotionState?.speed ?? 0),
-      lateralSpeed: Number.isFinite(locomotionState?.lateralSpeed) ? locomotionState.lateralSpeed : 0,
-      grounded: locomotionState?.grounded !== false,
-      verticalVel: Number.isFinite(locomotionState?.verticalVel) ? locomotionState.verticalVel : 0,
-      crouching: Boolean(locomotionState?.crouching),
-      wading: Boolean(locomotionState?.wading),
-      waterDepth: Number.isFinite(locomotionState?.waterDepth) ? clamp(locomotionState.waterDepth, 0, 1.5) : 0,
-      skidding: Boolean(locomotionState?.skidding),
-      exhausted: Boolean(locomotionState?.exhausted),
-      staminaRatio: Number.isFinite(locomotionState?.staminaRatio) ? clamp(locomotionState.staminaRatio, 0, 1) : 1.0,
-      turnRate: Number.isFinite(locomotionState?.turnRate) ? clamp(locomotionState.turnRate, -8, 8) : 0,
-      isSprinting: Boolean(locomotionState?.isSprinting),
-      panickedSprint: Boolean(locomotionState?.panickedSprint),
-      windIntensity: Number.isFinite(locomotionState?.windIntensity)
-        ? clamp(locomotionState.windIntensity, 0, 4.5)
-        : 0,
-      headPitchOverride: Number.isFinite(locomotionState?.headPitchOverride) ? locomotionState.headPitchOverride : null,
-      headYawOverride: Number.isFinite(locomotionState?.headYawOverride) ? locomotionState.headYawOverride : null,
-    };
+    // Sanitize locomotion state inputs into pre-allocated scratch object (zero GC)
+    const loc = this._locScratch;
+    const rawSwimMode =
+      typeof locomotionState?.swimMode === 'string' ? locomotionState.swimMode.toLowerCase() : 'none';
+    const swimMode =
+      rawSwimMode === 'tread' || rawSwimMode === 'stroke' || rawSwimMode === 'sprint' || rawSwimMode === 'dive'
+        ? rawSwimMode
+        : 'none';
+    const swimming = Boolean(locomotionState?.swimming) || swimMode !== 'none';
+
+    loc.speed = Number.isFinite(locomotionState?.speed) ? Math.max(0, locomotionState.speed) : 0;
+    loc.maxSprintSpeed =
+      Number.isFinite(locomotionState?.maxSprintSpeed) && locomotionState.maxSprintSpeed > 0.5
+        ? locomotionState.maxSprintSpeed
+        : 7.5;
+    loc.forwardSpeed = Number.isFinite(locomotionState?.forwardSpeed)
+      ? locomotionState.forwardSpeed
+      : (locomotionState?.speed ?? 0);
+    loc.lateralSpeed = Number.isFinite(locomotionState?.lateralSpeed) ? locomotionState.lateralSpeed : 0;
+    loc.grounded = locomotionState?.grounded !== false;
+    loc.verticalVel = Number.isFinite(locomotionState?.verticalVel) ? locomotionState.verticalVel : 0;
+    loc.crouching = Boolean(locomotionState?.crouching);
+    loc.wading = Boolean(locomotionState?.wading);
+    loc.waterDepth = Number.isFinite(locomotionState?.waterDepth) ? clamp(locomotionState.waterDepth, 0, 2.5) : 0;
+    loc.swimming = swimming;
+    loc.swimMode = swimMode;
+    loc.submerged = Boolean(locomotionState?.submerged) || swimMode === 'dive';
+    loc.verticalSwimVel = Number.isFinite(locomotionState?.verticalSwimVel)
+      ? clamp(locomotionState.verticalSwimVel, -6, 6)
+      : 0;
+    loc.skidding = Boolean(locomotionState?.skidding);
+    loc.exhausted = Boolean(locomotionState?.exhausted);
+    loc.staminaRatio = Number.isFinite(locomotionState?.staminaRatio) ? clamp(locomotionState.staminaRatio, 0, 1) : 1.0;
+    loc.turnRate = Number.isFinite(locomotionState?.turnRate) ? clamp(locomotionState.turnRate, -8, 8) : 0;
+    loc.isSprinting = Boolean(locomotionState?.isSprinting);
+    loc.panickedSprint = Boolean(locomotionState?.panickedSprint);
+    loc.windIntensity = Number.isFinite(locomotionState?.windIntensity)
+      ? clamp(locomotionState.windIntensity, 0, 4.5)
+      : 0;
+    loc.headPitchOverride = Number.isFinite(locomotionState?.headPitchOverride) ? locomotionState.headPitchOverride : null;
+    loc.headYawOverride = Number.isFinite(locomotionState?.headYawOverride) ? locomotionState.headYawOverride : null;
 
     // Ensure root world matrix reflects any controller position/yaw update before IK
     this.rig.root.updateMatrixWorld(true);
@@ -436,19 +652,19 @@ export class HumanAnimatorIK {
     this._invRootMat.copy(this.rig.root.matrixWorld).invert();
     this._invRootQuat.copy(this._rootQuat).invert();
 
-    // Advance one-shot & multi-stage expressive timers
-    const pendingFootsteps = [];
-    this._advanceTimers(safeDt, safeElapsed, loc, pendingFootsteps);
+    // Advance one-shot, emote & multi-stage expressive timers
+    this._pendingFootstepCount = 0;
+    this._advanceTimers(safeDt, safeElapsed, loc);
 
-    // Detect Jump -> Grounded landing compression & double-foot thud
-    if (!this._wasGrounded && loc.grounded) {
+    // Detect Jump -> Grounded landing compression & double-foot thud (skip when exiting water)
+    if (!this._wasGrounded && loc.grounded && !loc.swimming && !this._wasSwimming) {
       const impact = clamp(Math.abs(Math.min(this._prevVertVel, 0)) / 9.0, 0.25, 1.0);
       this._springs.landingBounce.impulse(-2.8 * impact);
       this._springs.backpackBounce.impulse(-0.65 * impact);
       this._springs.canteenPitch.impulse(3.2 * impact);
       this._springs.hairLocksPitch.impulse(-1.4 * impact);
-      pendingFootsteps.push({ side: 'L', intensity: clamp(0.55 + impact * 0.45, 0.4, 1.0) });
-      pendingFootsteps.push({ side: 'R', intensity: clamp(0.55 + impact * 0.45, 0.4, 1.0) });
+      this._pushPendingFootstep('L', clamp(0.55 + impact * 0.45, 0.4, 1.0));
+      this._pushPendingFootstep('R', clamp(0.55 + impact * 0.45, 0.4, 1.0));
     }
 
     // Track which leg leads when entering SkidStop
@@ -459,6 +675,21 @@ export class HumanAnimatorIK {
     // Resolve active state name
     const baseLocoState = this._resolveBaseLocomotionState(loc);
     this._stateName = this._resolveActiveState(baseLocoState);
+
+    // Advance continuous swimming cycle phase when swimming
+    if (loc.swimming) {
+      let swimHz = 1.35;
+      if (baseLocoState === 'SwimTread') {
+        swimHz = 1.45;
+      } else if (baseLocoState === 'SwimStroke') {
+        swimHz = lerp(0.95, 1.42, clamp(loc.speed / 3.0, 0, 1));
+      } else if (baseLocoState === 'SwimSprint') {
+        swimHz = lerp(1.55, 2.25, clamp(loc.speed / 4.8, 0, 1));
+      } else if (baseLocoState === 'SwimDive') {
+        swimHz = lerp(0.85, 1.32, clamp(Math.hypot(loc.speed, loc.verticalSwimVel) / 3.5, 0, 1));
+      }
+      this._swimPhase = (this._swimPhase + safeDt * swimHz * TWO_PI) % (TWO_PI * 100);
+    }
 
     // Advance rhythmic breathing phase
     const panicBreathBoost =
@@ -475,16 +706,18 @@ export class HumanAnimatorIK {
     this._breathPhase = (this._breathPhase + safeDt * breathHz * TWO_PI) % (TWO_PI * 100);
 
     // Advance stride phase & compute desired foot offsets + heel-strike callbacks
-    const stride = this._computeStridePlan(safeDt, safeElapsed, loc, baseLocoState, pendingFootsteps);
+    const stride = this._computeStridePlan(safeDt, safeElapsed, loc, baseLocoState);
 
-    // Compute target upper-body & facial posture for the active state
+    // Compute target upper-body & facial posture for the active state (including swim & emotes)
     const targetPose = this._computeTargetPose(safeDt, safeElapsed, loc, baseLocoState, stride);
 
-    // Smoothly blend base pose parameters (fast crisp damping, no abrupt pops)
+    // Smoothly blend base pose parameters (crisp athletic tracking on cyclic limb/pelvis channels, smooth posture transitions)
     const blendRate = 1.0 - Math.exp(-safeDt * 13.5);
+    const cyclicRate = 1.0 - Math.exp(-safeDt * 30.0);
     const faceBlendRate = 1.0 - Math.exp(-safeDt * 18.0);
     for (const key in this._smooth) {
-      const rate =
+      let rate = blendRate;
+      if (
         key === 'jawOpen' ||
         key === 'browHeight' ||
         key === 'browTilt' ||
@@ -492,8 +725,28 @@ export class HumanAnimatorIK {
         key === 'eyeSquint' ||
         key === 'eyeYaw' ||
         key === 'eyePitch'
-          ? faceBlendRate
-          : blendRate;
+      ) {
+        rate = faceBlendRate;
+      } else if (
+        key === 'hipsY' ||
+        key === 'hipsX' ||
+        key === 'hipsYaw' ||
+        key === 'hipsRoll' ||
+        key === 'torsoYaw' ||
+        key === 'torsoRoll' ||
+        key === 'armLPitch' ||
+        key === 'armRPitch' ||
+        key === 'armLRoll' ||
+        key === 'armRRoll' ||
+        key === 'forearmLPitch' ||
+        key === 'forearmRPitch' ||
+        key === 'wristLPitch' ||
+        key === 'wristRPitch' ||
+        key === 'wristLRoll' ||
+        key === 'wristRRoll'
+      ) {
+        rate = cyclicRate;
+      }
       this._smooth[key] = lerp(this._smooth[key], targetPose[key], rate);
     }
 
@@ -501,7 +754,7 @@ export class HumanAnimatorIK {
     const landingComp = this._springs.landingBounce.step(safeDt, 0);
 
     // Compute additive high-frequency expressive overlays (14Hz shake, 8Hz swipes, 20Hz shiver, shock flinch, blink)
-    const overlay = this._computeExpressiveOverlays(safeDt, safeElapsed, loc, pendingFootsteps);
+    const overlay = this._computeExpressiveOverlays(safeDt, safeElapsed, loc);
 
     // Apply spine, torso, head, eyes, eyelids, brows, jaw, and arm/5-finger hand poses
     this._applyUpperBodyAndFace(safeDt, safeElapsed, loc, stride, overlay, landingComp);
@@ -512,8 +765,19 @@ export class HumanAnimatorIK {
     // Update secondary spring-damper physics (backpack, hanging canteen, jacket hem, hair locks, head lag)
     this._applySecondaryPhysics(safeDt, safeElapsed, loc, overlay);
 
+    // Drive cloth simulation (Archer cloak & Ronin coat billowing smoothly with speed & wind)
+    this.rig.setClothMotion?.(loc.speed, loc.windIntensity, safeElapsed);
+
     // Refresh world transforms so eyeTarget, bones, and foot positions are exact this frame
     this.rig.root.updateMatrixWorld(true);
+
+    // Fade boot contact shadows smoothly to 0 while swimming, blending cleanly back to 1 when grounded/wading
+    const shadowTarget = loc.swimming ? 0.0 : 1.0;
+    const shadowRate = 1.0 - Math.exp(-safeDt * (loc.swimming ? 20.0 : 14.0));
+    this._swimShadowWeight = lerp(this._swimShadowWeight, shadowTarget, shadowRate);
+    if (loc.swimming && this._swimShadowWeight < 0.02) {
+      this._swimShadowWeight = 0.0;
+    }
 
     // Query exact boot sole world coordinates & update soft ground contact-shadow decals every frame
     this.rig.getFootWorldPositions(this._finalFootL, this._finalFootR);
@@ -532,8 +796,9 @@ export class HumanAnimatorIK {
       );
       this._shadowPosL.set(this._finalFootL.x, surfYL, this._finalFootL.z);
       this._shadowPosR.set(this._finalFootR.x, surfYR, this._finalFootR.z);
-      const liftL = Math.max(0, this._finalFootL.y - surfYL);
-      const liftR = Math.max(0, this._finalFootR.y - surfYR);
+      const swimLiftPenalty = (1.0 - this._swimShadowWeight) * 0.48;
+      const liftL = Math.max(0, this._finalFootL.y - surfYL) + swimLiftPenalty;
+      const liftR = Math.max(0, this._finalFootR.y - surfYR) + swimLiftPenalty;
       this.rig.updateContactShadows(
         this._shadowPosL,
         this._shadowNormL,
@@ -545,9 +810,9 @@ export class HumanAnimatorIK {
     }
 
     // Emit crisp footstep callbacks with exact updated boot sole world coordinates
-    if (typeof onFootstep === 'function' && pendingFootsteps.length > 0) {
-      for (let i = 0; i < pendingFootsteps.length; i++) {
-        const ev = pendingFootsteps[i];
+    if (typeof onFootstep === 'function' && this._pendingFootstepCount > 0) {
+      for (let i = 0; i < this._pendingFootstepCount; i++) {
+        const ev = this._footstepPool[i];
         const pos = ev.side === 'L' ? this._finalFootL.clone() : this._finalFootR.clone();
         onFootstep({
           side: ev.side,
@@ -558,6 +823,7 @@ export class HumanAnimatorIK {
     }
 
     this._wasGrounded = loc.grounded;
+    this._wasSwimming = loc.swimming;
     this._prevSpeed = loc.speed;
     this._prevVertVel = loc.verticalVel;
   }
@@ -566,7 +832,7 @@ export class HumanAnimatorIK {
   // Timers & State Resolution
   // ---------------------------------------------------------------------------
 
-  _advanceTimers(dt, elapsed, loc, pendingFootsteps) {
+  _advanceTimers(dt, elapsed, loc) {
     // Slip recovery (1.2s)
     if (this._slipTimer >= 0) {
       this._slipTimer += dt;
@@ -608,7 +874,7 @@ export class HumanAnimatorIK {
           const hopSin = Math.sin(stageT * 4.2 * TWO_PI);
           if (this._prevHopSin > 0 && hopSin <= 0) {
             const standSide = this._panicSide === 'L' ? 'R' : 'L';
-            pendingFootsteps.push({ side: standSide, intensity: 0.55 });
+            this._pushPendingFootstep(standSide, 0.55);
           }
           this._prevHopSin = hopSin;
         }
@@ -616,6 +882,26 @@ export class HumanAnimatorIK {
         this._panicStage = 3;
       } else {
         this._panicStage = 4;
+      }
+    }
+
+    // Playable Emote progression & smooth auto-cancel on movement/jump/crouch/swim/slip/panic
+    if (this._emoteName && this._emoteTimer >= 0) {
+      const shouldCancelEmote =
+        loc.speed > 0.35 ||
+        !loc.grounded ||
+        loc.crouching ||
+        loc.swimming ||
+        loc.skidding ||
+        this._slipTimer >= 0 ||
+        this._panicActive;
+      if (shouldCancelEmote) {
+        this.cancelEmote();
+      } else {
+        this._emoteTimer += dt;
+        if (this._emoteTimer >= this._emoteDuration) {
+          this.cancelEmote();
+        }
       }
     }
 
@@ -654,6 +940,16 @@ export class HumanAnimatorIK {
   }
 
   _resolveBaseLocomotionState(loc) {
+    if (loc.swimming) {
+      if (loc.swimMode === 'dive' || (loc.swimMode === 'none' && loc.submerged)) return 'SwimDive';
+      if (loc.swimMode === 'sprint' || (loc.swimMode === 'none' && (loc.isSprinting || loc.speed >= 3.2))) {
+        return 'SwimSprint';
+      }
+      if (loc.swimMode === 'stroke' || (loc.swimMode === 'none' && loc.speed >= 0.35)) {
+        return 'SwimStroke';
+      }
+      return 'SwimTread';
+    }
     if (!loc.grounded) return 'Jump';
     if (loc.skidding) return 'SkidStop';
     if (loc.wading || loc.waterDepth > 0.14) return 'StreamWade';
@@ -668,65 +964,70 @@ export class HumanAnimatorIK {
     if (this._panicActive) return 'RatPanicShake';
     if (this._slipTimer >= 0) return 'SlipRecovery';
     if (this._thunderTimer >= 0) return 'ThunderFlinch';
+    if (this._emoteName) return this._emoteName;
     return baseLocoState;
   }
 
   // ---------------------------------------------------------------------------
-  // Procedural Stride Cycle & Foot Trajectory Planning
+  // Procedural Distance-Locked Stride Cycle & Zero-Slide Foot Trajectory Planning
   // ---------------------------------------------------------------------------
 
-  _computeStridePlan(dt, elapsed, loc, baseLocoState, pendingFootsteps) {
+  _computeStridePlan(dt, elapsed, loc, baseLocoState) {
     const speedRatio = clamp(loc.speed / loc.maxSprintSpeed, 0, 1.25);
-    const panicSprinting = this._panicActive && loc.panickedSprint && loc.grounded && loc.speed > 0.4;
+    const panicSprinting =
+      this._panicActive && loc.panickedSprint && loc.grounded && !loc.swimming && loc.speed > 0.4;
     const isMoving =
       loc.grounded &&
+      !loc.swimming &&
       !loc.skidding &&
       loc.speed >= 0.18 &&
       !(this._panicActive && (this._panicStage === 1 || (this._panicStage === 2 && !loc.panickedSprint)));
 
-    let strideLen = 0.0;
+    let strideLen = 1.44;
+    let stanceDuty = 0.5;
     let stepHeight = 0.0;
     let stanceWidth = this._hipOffsetX;
-    let cadence = 0.0;
+    const isSprintGait = baseLocoState === 'FullSprint' || panicSprinting;
 
     if (isMoving) {
       if (panicSprinting) {
-        // Erratic ungainly panicked sprint cadence
-        const jitter = 1.0 + 0.16 * Math.sin(elapsed * 9.2);
-        strideLen = lerp(0.75, 1.18, clamp(speedRatio, 0, 1));
-        stepHeight = 0.24 + 0.05 * Math.abs(Math.sin(elapsed * 7.1));
+        strideLen = lerp(1.82, 2.52, clamp(speedRatio, 0, 1));
+        stanceDuty = 0.4;
+        stepHeight = 0.25 + 0.04 * Math.abs(Math.sin(elapsed * 7.1));
         stanceWidth = this._hipOffsetX + 0.048;
-        cadence = Math.max(loc.speed / Math.max(strideLen * 0.85, 0.5), 2.1) * jitter;
       } else if (baseLocoState === 'StreamWade') {
-        strideLen = lerp(0.38, 0.64, clamp(speedRatio * 1.4, 0, 1));
+        strideLen = 1.28;
+        stanceDuty = 0.5;
         stepHeight = 0.24 + clamp(loc.waterDepth, 0, 0.75) * 0.16;
         stanceWidth = this._hipOffsetX + 0.04;
-        cadence = loc.speed / Math.max(strideLen * 1.15, 0.42);
       } else if (baseLocoState === 'Crouch') {
-        strideLen = lerp(0.32, 0.52, clamp(speedRatio * 1.8, 0, 1));
-        stepHeight = 0.075;
+        strideLen = 1.05;
+        stanceDuty = 0.5;
+        stepHeight = 0.08;
         stanceWidth = this._hipOffsetX + 0.025;
-        cadence = loc.speed / Math.max(strideLen * 1.08, 0.36);
       } else if (baseLocoState === 'FullSprint') {
-        strideLen = lerp(1.06, 1.32, clamp((speedRatio - 0.7) / 0.35, 0, 1));
-        stepHeight = 0.21;
+        const sprintT = clamp((loc.speed - 4.2) / Math.max(loc.maxSprintSpeed - 4.2, 1.8), 0, 1);
+        strideLen = lerp(2.05, 2.72, sprintT);
+        stanceDuty = lerp(0.44, 0.36, sprintT);
+        stepHeight = lerp(0.18, 0.27, sprintT);
         stanceWidth = this._hipOffsetX - 0.008;
-        cadence = loc.speed / Math.max(strideLen * 0.92, 0.65);
       } else if (baseLocoState === 'Jog') {
-        strideLen = lerp(0.78, 1.04, clamp((loc.speed - 2.5) / 3.2, 0, 1));
-        stepHeight = 0.145;
+        const jogT = clamp((loc.speed - 2.55) / 1.65, 0, 1);
+        strideLen = lerp(1.44, 2.05, jogT);
+        stanceDuty = lerp(0.5, 0.44, jogT);
+        stepHeight = lerp(0.105, 0.17, jogT);
         stanceWidth = this._hipOffsetX;
-        cadence = loc.speed / Math.max(strideLen * 0.98, 0.55);
       } else {
-        // Walk
-        strideLen = lerp(0.42, 0.72, clamp(loc.speed / 2.55, 0, 1));
-        stepHeight = lerp(0.055, 0.095, clamp(loc.speed / 2.55, 0, 1));
+        // Walk (1.44m stride)
+        strideLen = 1.44;
+        stanceDuty = 0.5;
+        stepHeight = lerp(0.058, 0.1, clamp(loc.speed / 2.55, 0, 1));
         stanceWidth = this._hipOffsetX + 0.006;
-        cadence = loc.speed / Math.max(strideLen * 1.04, 0.42);
       }
 
+      // Lock stridePhase strictly to real horizontal travel distance so stance boots NEVER slide!
       const dirSign = loc.forwardSpeed < -0.25 ? -1 : 1;
-      const dPhase = clamp(cadence, 0.4, 4.4) * Math.PI * dt * dirSign;
+      const dPhase = (loc.speed / Math.max(strideLen, 0.4)) * TWO_PI * dt * dirSign;
       this._stridePhase = (this._stridePhase + dPhase + TWO_PI * 10) % TWO_PI;
 
       const pL = this._stridePhase;
@@ -734,93 +1035,116 @@ export class HumanAnimatorIK {
 
       // Detect heel strike (phase crossing PI: swing -> stance)
       const stepIntensity = clamp(
-        0.24 + speedRatio * 0.72 + (baseLocoState === 'StreamWade' ? 0.18 : 0) - (baseLocoState === 'Crouch' ? 0.15 : 0),
+        0.24 +
+          speedRatio * 0.72 +
+          (baseLocoState === 'StreamWade' ? 0.18 : 0) -
+          (baseLocoState === 'Crouch' ? 0.15 : 0),
         0.15,
         1.0
       );
       if (dirSign > 0) {
         if (this._prevPhaseL < Math.PI && pL >= Math.PI) {
-          pendingFootsteps.push({ side: 'L', intensity: stepIntensity });
+          this._pushPendingFootstep('L', stepIntensity);
         }
         if (this._prevPhaseR < Math.PI && pR >= Math.PI) {
-          pendingFootsteps.push({ side: 'R', intensity: stepIntensity });
+          this._pushPendingFootstep('R', stepIntensity);
         }
       } else {
         if (this._prevPhaseL > Math.PI && pL <= Math.PI) {
-          pendingFootsteps.push({ side: 'L', intensity: stepIntensity * 0.85 });
+          this._pushPendingFootstep('L', stepIntensity * 0.85);
         }
         if (this._prevPhaseR > Math.PI && pR <= Math.PI) {
-          pendingFootsteps.push({ side: 'R', intensity: stepIntensity * 0.85 });
+          this._pushPendingFootstep('R', stepIntensity * 0.85);
         }
       }
 
       this._prevPhaseL = pL;
       this._prevPhaseR = pR;
     } else {
-      // Gently relax phase toward neutral planted stance when stationary
       this._prevPhaseL = this._stridePhase;
       this._prevPhaseR = (this._stridePhase + Math.PI) % TWO_PI;
     }
 
     const pL = this._stridePhase;
     const pR = (this._stridePhase + Math.PI) % TWO_PI;
-
-    // Lateral strafe component
     const strafeAmp = clamp(loc.lateralSpeed / Math.max(loc.maxSprintSpeed * 0.6, 2.0), -0.35, 0.35);
 
-    const evalFoot = (p, sideSign) => {
+    const stanceAngle = TWO_PI * stanceDuty;
+    const stanceEnd = Math.PI + stanceAngle;
+    const swingAngle = Math.max(TWO_PI - stanceAngle, 0.001);
+    // Exact contact sweep = strideLen * stanceDuty -> d(z_foot)/dt === -horizontalSpeed during stance!
+    const halfSweep = strideLen * stanceDuty * 0.5;
+
+    const evalFoot = (p, sideSign, out) => {
       if (!isMoving) {
-        return { x: sideSign * stanceWidth, z: 0, lift: 0, swing: 0, anklePitch: 0, toeBend: 0 };
+        out.x = sideSign * stanceWidth;
+        out.z = 0;
+        out.lift = 0;
+        out.swing = 0;
+        out.anklePitch = 0;
+        out.toeBend = 0;
+        return out;
       }
-      const inSwing = p < Math.PI;
-      const swingSin = inSwing ? Math.sin(p) : 0;
-      const lift = inSwing ? Math.pow(swingSin, 1.15) * stepHeight : 0;
 
-      // Continuous fore-aft trajectory: cosine sweep in swing, constant-velocity linear pull in stance
-      const foreAftNorm = inSwing ? -Math.cos(p) : 1.0 - 2.0 * ((p - Math.PI) / Math.PI);
-      const z = foreAftNorm * (strideLen * 0.5);
-      const x = sideSign * stanceWidth + foreAftNorm * strafeAmp * 0.25;
-
-      // Heel-strike dorsiflexion (-X) on landing, smooth plantarflexion + toe push-off near p -> 2*PI
+      const inStance = p >= Math.PI && p < stanceEnd;
+      let foreAftNorm;
+      let lift = 0;
+      let swing = 0;
       let anklePitch = 0;
       let toeBend = 0;
-      if (inSwing) {
-        // Subtle toe clearance mid-swing, heel pitch preparing for strike near PI
-        const strikePrep = smoothstep(Math.PI * 0.62, Math.PI, p);
-        const toeDrag = smoothstep(0.0, Math.PI * 0.35, p) * (1.0 - strikePrep);
-        anklePitch = toeDrag * 0.22 - strikePrep * 0.24;
-        toeBend = -toeDrag * 0.12;
+
+      if (inStance) {
+        const stanceT = (p - Math.PI) / stanceAngle; // 0 = heel strike, 1 = toe-off
+        foreAftNorm = 1.0 - 2.0 * stanceT;
+        const strikeSettle = 1.0 - smoothstep(0.0, 0.2, stanceT);
+        const pushOff = smoothstep(0.58, 1.0, stanceT);
+        anklePitch = -strikeSettle * (isSprintGait ? 0.2 : 0.16) + pushOff * (isSprintGait ? 0.38 : 0.3);
+        toeBend = -pushOff * (isSprintGait ? 0.46 : 0.4);
       } else {
-        const stanceT = (p - Math.PI) / Math.PI; // 0 = heel strike, 1 = toe-off
-        const pushOff = smoothstep(0.62, 1.0, stanceT);
-        const strikeSettle = 1.0 - smoothstep(0.0, 0.22, stanceT);
-        anklePitch = -strikeSettle * 0.16 + pushOff * 0.32;
-        toeBend = -pushOff * 0.42; // toes flex UP while heel pushes off!
+        const rawSwing = p >= stanceEnd ? p - stanceEnd : p + (TWO_PI - stanceEnd);
+        const swingT = clamp(rawSwing / swingAngle, 0, 1);
+        const swingSin = Math.sin(swingT * Math.PI);
+        // High knee drive shaping on swing leg during sprint
+        const driveSin = isSprintGait ? Math.sin(Math.pow(swingT, 0.84) * Math.PI) : swingSin;
+        lift = Math.pow(Math.max(0, driveSin), 1.08) * stepHeight;
+        swing = swingSin;
+        foreAftNorm = -Math.cos(swingT * Math.PI);
+
+        // Crisp ankle dorsiflexion (toes lifted slightly upward -X) before heel strike!
+        const strikePrep = smoothstep(0.52, 1.0, swingT);
+        const toeDrag = smoothstep(0.0, 0.32, swingT) * (1.0 - strikePrep);
+        anklePitch = toeDrag * 0.22 - strikePrep * (isSprintGait ? 0.32 : 0.24);
+        toeBend = -toeDrag * 0.12;
       }
 
-      return { x, z, lift, swing: swingSin, anklePitch, toeBend };
+      out.x = sideSign * stanceWidth + foreAftNorm * strafeAmp * 0.25;
+      out.z = foreAftNorm * halfSweep;
+      out.lift = lift;
+      out.swing = swing;
+      out.anklePitch = anklePitch;
+      out.toeBend = toeBend;
+      return out;
     };
 
-    const left = evalFoot(pL, 1);
-    const right = evalFoot(pR, -1);
+    evalFoot(pL, 1, this._leftFootScratch);
+    evalFoot(pR, -1, this._rightFootScratch);
 
-    return {
-      isMoving,
-      panicSprinting,
-      speedRatio,
-      strideLen,
-      stepHeight,
-      stanceWidth,
-      phase: this._stridePhase,
-      sinPhase: Math.sin(this._stridePhase),
-      cosPhase: Math.cos(this._stridePhase),
-      left,
-      right,
-    };
+    const out = this._strideScratch;
+    out.isMoving = isMoving;
+    out.panicSprinting = panicSprinting;
+    out.speedRatio = speedRatio;
+    out.strideLen = strideLen;
+    out.stanceDuty = stanceDuty;
+    out.stepHeight = stepHeight;
+    out.stanceWidth = stanceWidth;
+    out.phase = this._stridePhase;
+    out.sinPhase = Math.sin(this._stridePhase);
+    out.cosPhase = Math.cos(this._stridePhase);
+    return out;
   }
 
   // ---------------------------------------------------------------------------
-  // Base State Pose Synthesis (All 11 States)
+  // Base State Pose Synthesis (Locomotion, Swimming/Diving & Playable Emotes)
   // ---------------------------------------------------------------------------
 
   _computeTargetPose(dt, elapsed, loc, baseLocoState, stride) {
@@ -829,48 +1153,47 @@ export class HumanAnimatorIK {
     const sp = stride.sinPhase;
     const cp = stride.cosPhase;
 
-    // Start from calm relaxed Idle posture
-    const p = {
-      hipsY: this._hipBindY - 0.015,
-      hipsX: 0,
-      hipsZ: 0,
-      hipsPitch: 0.02,
-      hipsYaw: 0,
-      hipsRoll: 0,
-      torsoPitch: 0.02 + breath * 0.012,
-      torsoYaw: 0,
-      torsoRoll: 0,
-      neckPitch: -0.02,
-      neckYaw: 0,
-      headPitch: 0,
-      headYaw: 0,
-      headRoll: 0,
-      clavLShrug: breath * 0.014,
-      clavRShrug: breath * 0.014,
-      armLPitch: 0.04,
-      armLRoll: 0.11,
-      armLYaw: 0.06,
-      forearmLPitch: -0.22,
-      wristLPitch: 0,
-      wristLYaw: 0,
-      wristLRoll: 0,
-      fingerLCurl: 0.22,
-      armRPitch: 0.04,
-      armRRoll: -0.11,
-      armRYaw: -0.06,
-      forearmRPitch: -0.22,
-      wristRPitch: 0,
-      wristRYaw: 0,
-      wristRRoll: 0,
-      fingerRCurl: 0.22,
-      jawOpen: 0,
-      browHeight: 0,
-      browTilt: 0,
-      eyeWide: 0,
-      eyeSquint: 0,
-      eyeYaw: 0,
-      eyePitch: 0,
-    };
+    // Reset pre-allocated target pose scratch to calm relaxed Idle posture (zero GC)
+    const p = this._targetPoseScratch;
+    p.hipsY = this._hipBindY - 0.015;
+    p.hipsX = 0;
+    p.hipsZ = 0;
+    p.hipsPitch = 0.02;
+    p.hipsYaw = 0;
+    p.hipsRoll = 0;
+    p.torsoPitch = 0.02 + breath * 0.012;
+    p.torsoYaw = 0;
+    p.torsoRoll = 0;
+    p.neckPitch = -0.02;
+    p.neckYaw = 0;
+    p.headPitch = 0;
+    p.headYaw = 0;
+    p.headRoll = 0;
+    p.clavLShrug = breath * 0.014;
+    p.clavRShrug = breath * 0.014;
+    p.armLPitch = 0.04;
+    p.armLRoll = 0.11;
+    p.armLYaw = 0.06;
+    p.forearmLPitch = -0.22;
+    p.wristLPitch = 0;
+    p.wristLYaw = 0;
+    p.wristLRoll = 0;
+    p.fingerLCurl = 0.22;
+    p.armRPitch = 0.04;
+    p.armRRoll = -0.11;
+    p.armRYaw = -0.06;
+    p.forearmRPitch = -0.22;
+    p.wristRPitch = 0;
+    p.wristRYaw = 0;
+    p.wristRRoll = 0;
+    p.fingerRCurl = 0.22;
+    p.jawOpen = 0;
+    p.browHeight = 0;
+    p.browTilt = 0;
+    p.eyeWide = 0;
+    p.eyeSquint = 0;
+    p.eyeYaw = 0;
+    p.eyePitch = 0;
 
     const activeBase = stride.panicSprinting ? 'FullSprint' : baseLocoState;
 
@@ -910,20 +1233,23 @@ export class HumanAnimatorIK {
         p.eyeSquint = 0.16;
       }
     } else if (activeBase === 'Walk') {
-      const walkBob = Math.abs(Math.sin(stride.phase)) * 0.032;
-      p.hipsY = this._hipBindY - 0.028 + walkBob;
-      p.hipsX = cp * 0.022;
-      p.hipsYaw = -cp * 0.085;
-      p.hipsRoll = cp * 0.04;
-      p.torsoPitch = 0.075 + speedRatio * 0.06;
-      p.torsoYaw = cp * 0.13;
-      p.torsoRoll = -cp * 0.045 + clamp(loc.turnRate * 0.06, -0.16, 0.16);
-      // Stabilize head against torso twist
-      p.headYaw = -p.torsoYaw * 0.65;
-      p.headPitch = -0.04;
+      // Smooth 4° (0.070 rad) forward walk lean + double-frequency 2x inverted-pendulum bounce + stance hip drop
+      const walkT = clamp(loc.speed / 2.2, 0, 1);
+      const walkBounce2x = (0.5 - 0.5 * Math.cos(stride.phase * 2.0)) * 0.03;
+      p.hipsY = this._hipBindY - 0.026 + walkBounce2x;
+      p.hipsX = -sp * 0.02;
+      p.hipsPitch = 0.0;
+      p.hipsYaw = cp * 0.08;
+      p.hipsRoll = sp * 0.036;
+      p.torsoPitch = lerp(0.045, 0.07, walkT);
+      p.torsoYaw = -cp * 0.14;
+      p.torsoRoll = -p.hipsRoll * 1.05 + clamp(loc.turnRate * 0.06, -0.16, 0.16);
+      p.neckPitch = -p.torsoPitch * 0.35;
+      p.headPitch = -p.torsoPitch * 0.45;
+      p.headYaw = -(p.hipsYaw + p.torsoYaw) * 0.78;
 
       // Counter-swinging arms (opposite phase to legs: when L leg is forward (cp < 0), L arm swings back (+X))
-      const armSwing = 0.42 * clamp(loc.speed / 2.2, 0.35, 1.15);
+      const armSwing = 0.42 * clamp(loc.speed / 2.2, 0.35, 1.12);
       p.armLPitch = -cp * armSwing;
       p.armRPitch = cp * armSwing;
       p.armLRoll = 0.1;
@@ -933,58 +1259,64 @@ export class HumanAnimatorIK {
       p.fingerLCurl = 0.3;
       p.fingerRCurl = 0.3;
     } else if (activeBase === 'Jog') {
-      const jogBob = Math.abs(sp) * 0.062;
-      p.hipsY = this._hipBindY - 0.055 + jogBob;
-      p.hipsX = cp * 0.024;
-      p.hipsYaw = -cp * 0.12;
-      p.hipsRoll = cp * 0.05;
-      p.torsoPitch = 0.22;
-      p.torsoYaw = cp * 0.18;
-      p.torsoRoll = -cp * 0.055 + clamp(loc.turnRate * 0.08, -0.22, 0.22);
-      p.neckPitch = -0.1;
-      p.headPitch = -0.08;
-      p.headYaw = -p.torsoYaw * 0.72;
+      // Smooth 4° -> 9° (0.070 -> 0.157 rad) jog lean + double-frequency 2x spring bounce + stance hip drop
+      const jogT = clamp((loc.speed - 2.55) / 1.65, 0, 1);
+      const jogBounce2x = (0.5 + 0.5 * Math.cos(stride.phase * 2.0 - 0.3)) * 0.052;
+      p.hipsY = this._hipBindY - 0.052 + jogBounce2x;
+      p.hipsX = -sp * 0.022;
+      p.hipsPitch = 0.0;
+      p.hipsYaw = cp * 0.11;
+      p.hipsRoll = sp * 0.045;
+      p.torsoPitch = lerp(0.07, 0.157, jogT);
+      p.torsoYaw = -cp * 0.21;
+      p.torsoRoll = -p.hipsRoll * 1.05 + clamp(loc.turnRate * 0.08, -0.22, 0.22);
+      p.neckPitch = -p.torsoPitch * 0.42;
+      p.headPitch = -p.torsoPitch * 0.48;
+      p.headYaw = -(p.hipsYaw + p.torsoYaw) * 0.82;
 
-      const armSwing = 0.72;
-      p.armLPitch = -cp * armSwing;
-      p.armRPitch = cp * armSwing;
-      p.armLRoll = 0.14;
-      p.armRRoll = -0.14;
+      const armSwing = lerp(0.58, 0.78, jogT);
+      p.armLPitch = -cp * armSwing - 0.05;
+      p.armRPitch = cp * armSwing - 0.05;
+      p.armLRoll = 0.13;
+      p.armRRoll = -0.13;
       p.armLYaw = -0.12;
       p.armRYaw = 0.12;
-      p.forearmLPitch = -1.18 - Math.max(0, -p.armLPitch) * 0.32;
-      p.forearmRPitch = -1.18 - Math.max(0, -p.armRPitch) * 0.32;
+      p.forearmLPitch = lerp(-1.12, -1.36, jogT) - clamp(-p.armLPitch, 0, 0.85) * 0.16;
+      p.forearmRPitch = lerp(-1.12, -1.36, jogT) - clamp(-p.armRPitch, 0, 0.85) * 0.16;
       p.fingerLCurl = 0.85;
       p.fingerRCurl = 0.85;
       p.browTilt = -0.08;
       p.jawOpen = 0.06 + (1 - loc.staminaRatio) * 0.08;
     } else if (activeBase === 'FullSprint') {
-      // Forward athletic lean (16°-26° = 0.28..0.45 rad), powerful pumping elbows, clenched fists, furrowed brows
-      const sprintIntensity = clamp((speedRatio - 0.65) / 0.35, 0, 1);
-      const sprintBob = Math.abs(sp) * 0.082;
-      p.hipsY = this._hipBindY - 0.088 + sprintBob;
-      p.hipsX = cp * 0.026;
-      p.hipsPitch = 0.08;
-      p.hipsYaw = -cp * 0.17;
-      p.hipsRoll = cp * 0.065;
-      p.torsoPitch = lerp(0.30, 0.44, sprintIntensity);
-      p.torsoYaw = cp * 0.26;
-      p.torsoRoll = -cp * 0.065 + clamp(loc.turnRate * 0.11, -0.28, 0.28);
-      p.neckPitch = -0.16;
-      p.headPitch = -0.14;
-      p.headYaw = -p.torsoYaw * 0.78;
-      p.clavLShrug = 0.08;
-      p.clavRShrug = 0.08;
+      // Crisp 14° (0.244 rad) forward athletic torso lean blending smoothly from 9° jog,
+      // 2x stridePhase pelvis vertical bounce, stance-side pelvic hip drop, ~16° (0.28 rad)
+      // opposing chest/shoulder counter-rotation, and tight 90°-100° (1.57-1.74 rad) pumping elbows!
+      const sprintT = clamp((loc.speed - 4.2) / Math.max(loc.maxSprintSpeed - 4.2, 1.8), 0, 1);
+      const sprintBounce2x = (0.5 + 0.5 * Math.cos(stride.phase * 2.0 - 0.35)) * 0.068;
+      p.hipsY = this._hipBindY - 0.074 + sprintBounce2x;
+      p.hipsX = -sp * 0.024;
+      p.hipsPitch = 0.0;
+      p.hipsYaw = cp * 0.16;
+      p.hipsRoll = sp * 0.062; // realistic slight pelvic hip drop on stance side
+      p.torsoPitch = lerp(0.157, 0.244, sprintT); // crisp 14° (0.244 rad) at full sprint!
+      p.torsoYaw = -cp * 0.32; // delivers ~16° (0.28 rad) opposing chest/shoulder counter-rotation at sprint cadence
+      p.torsoRoll = -p.hipsRoll * 1.05 + clamp(loc.turnRate * 0.1, -0.26, 0.26);
+      p.neckPitch = -p.torsoPitch * 0.44;
+      p.headPitch = -p.torsoPitch * 0.48;
+      p.headYaw = -(p.hipsYaw + p.torsoYaw) * 0.85;
+      p.clavLShrug = 0.06;
+      p.clavRShrug = 0.06;
 
-      const armSwing = 1.08;
-      p.armLPitch = -cp * armSwing - 0.08;
-      p.armRPitch = cp * armSwing - 0.08;
-      p.armLRoll = 0.18;
-      p.armRRoll = -0.18;
-      p.armLYaw = -0.18;
-      p.armRYaw = 0.18;
-      p.forearmLPitch = -1.52 - Math.max(0, -p.armLPitch) * 0.32;
-      p.forearmRPitch = -1.52 - Math.max(0, -p.armRPitch) * 0.32;
+      // Athletic front-to-back pumping arms with tight 90°-100° (1.57-1.74 rad) bent elbows!
+      const armSwing = 1.02;
+      p.armLPitch = -cp * armSwing - 0.1;
+      p.armRPitch = cp * armSwing - 0.1;
+      p.armLRoll = 0.14;
+      p.armRRoll = -0.14;
+      p.armLYaw = -0.16;
+      p.armRYaw = 0.16;
+      p.forearmLPitch = -1.59 - clamp(-p.armLPitch, 0, 1.15) * 0.125;
+      p.forearmRPitch = -1.59 - clamp(-p.armRPitch, 0, 1.15) * 0.125;
       // Tightly clenched sprinting fists
       p.fingerLCurl = 1.32;
       p.fingerRCurl = 1.32;
@@ -1037,16 +1369,16 @@ export class HumanAnimatorIK {
       p.fingerRCurl = 0.12;
     } else if (activeBase === 'Crouch') {
       const moveAmt = stride.isMoving ? 1 : 0;
-      const crouchBob = moveAmt * Math.abs(sp) * 0.026;
+      const crouchBob = moveAmt * (0.5 - 0.5 * Math.cos(stride.phase * 2.0)) * 0.026;
       p.hipsY = this._hipBindY - 0.36 + crouchBob;
-      p.hipsX = moveAmt * cp * 0.025;
-      p.hipsYaw = moveAmt * -cp * 0.1;
+      p.hipsX = moveAmt * -sp * 0.024;
+      p.hipsYaw = moveAmt * cp * 0.1;
       p.hipsPitch = 0.16;
       p.torsoPitch = 0.34;
-      p.torsoYaw = moveAmt * cp * 0.12;
+      p.torsoYaw = moveAmt * -cp * 0.12;
       p.neckPitch = -0.22;
       p.headPitch = -0.24;
-      p.headYaw = moveAmt ? -p.torsoYaw * 0.6 : this._glanceYaw * 0.7;
+      p.headYaw = moveAmt ? -(p.hipsYaw + p.torsoYaw) * 0.6 : this._glanceYaw * 0.7;
       p.clavLShrug = 0.05;
       p.clavRShrug = 0.05;
       // Stealthy compact arms tucked ready for balance
@@ -1060,14 +1392,16 @@ export class HumanAnimatorIK {
       p.fingerRCurl = 0.38;
       p.browTilt = -0.12;
     } else if (activeBase === 'StreamWade') {
-      const wadeBob = stride.isMoving ? Math.abs(sp) * 0.055 : Math.sin(elapsed * 1.4) * 0.012;
+      const wadeBob = stride.isMoving
+        ? (0.5 - 0.5 * Math.cos(stride.phase * 2.0)) * 0.052
+        : Math.sin(elapsed * 1.4) * 0.012;
       p.hipsY = this._hipBindY - 0.065 + wadeBob;
-      p.hipsX = stride.isMoving ? cp * 0.042 : Math.sin(elapsed * 1.1) * 0.015;
-      p.hipsRoll = stride.isMoving ? cp * 0.075 : 0;
-      p.hipsYaw = stride.isMoving ? -cp * 0.12 : 0;
+      p.hipsX = stride.isMoving ? -sp * 0.042 : Math.sin(elapsed * 1.1) * 0.015;
+      p.hipsRoll = stride.isMoving ? sp * 0.065 : 0;
+      p.hipsYaw = stride.isMoving ? cp * 0.12 : 0;
       p.torsoPitch = 0.14 + (stride.isMoving ? 0.06 : 0);
-      p.torsoRoll = stride.isMoving ? -cp * 0.09 : 0;
-      p.torsoYaw = stride.isMoving ? cp * 0.15 : 0;
+      p.torsoRoll = stride.isMoving ? -p.hipsRoll * 1.1 : 0;
+      p.torsoYaw = stride.isMoving ? -cp * 0.15 : 0;
       p.headPitch = 0.12; // watches footing in rocky stream
       p.clavLShrug = 0.1;
       p.clavRShrug = 0.1;
@@ -1081,12 +1415,147 @@ export class HumanAnimatorIK {
       p.forearmRPitch = -0.92;
       p.fingerLCurl = 0.1;
       p.fingerRCurl = 0.1;
+    } else if (activeBase === 'SwimTread') {
+      // Gentle buoyancy bobbing, upright ~8° torso, alternating outward sculling forearms & flat splayed palms
+      const sw = this._swimPhase;
+      const scullL = Math.sin(sw);
+      const scullR = Math.sin(sw + Math.PI * 0.85);
+      p.hipsY = this._hipBindY - 0.08 + Math.sin(elapsed * 2.15) * 0.044;
+      p.hipsX = Math.sin(sw * 0.5) * 0.022;
+      p.hipsPitch = 0.04;
+      p.hipsRoll = Math.sin(sw) * 0.042;
+      p.torsoPitch = 0.10; // combined hips + torso ~ 0.14 rad (~8° upright buoyancy tilt)
+      p.torsoRoll = -p.hipsRoll * 0.65;
+      p.torsoYaw = Math.cos(sw) * 0.06;
+      p.neckPitch = -0.05;
+      p.headPitch = -0.09 + Math.sin(elapsed * 1.4) * 0.025;
+      p.headYaw = this._glanceYaw * 0.55;
+      p.clavLShrug = 0.08;
+      p.clavRShrug = 0.08;
+
+      p.armLPitch = -0.52 + scullL * 0.24;
+      p.armRPitch = -0.52 + scullR * 0.24;
+      p.armLRoll = 0.72 + Math.cos(sw) * 0.28;
+      p.armRRoll = -(0.72 + Math.cos(sw + Math.PI * 0.85) * 0.28);
+      p.armLYaw = -0.24 + scullL * 0.34;
+      p.armRYaw = 0.24 - scullR * 0.34;
+      p.forearmLPitch = -0.82 - Math.max(0, scullL) * 0.26;
+      p.forearmRPitch = -0.82 - Math.max(0, scullR) * 0.26;
+      p.wristLPitch = Math.cos(sw) * 0.34;
+      p.wristRPitch = Math.cos(sw + Math.PI * 0.85) * 0.34;
+      p.wristLRoll = scullL * 0.36;
+      p.wristRRoll = -scullR * 0.36;
+      p.fingerLCurl = -0.18; // flat splayed sculling hands
+      p.fingerRCurl = -0.18;
+    } else if (activeBase === 'SwimStroke') {
+      // Angled breaststroke (~62° = 1.08 rad forward pitch), wide synchronized sweeping arm pulls
+      const sw = this._swimPhase;
+      const c = Math.cos(sw);
+      const s = Math.sin(sw);
+      p.hipsY = this._hipBindY - 0.24 + Math.sin(sw - 0.45) * 0.052;
+      p.hipsPitch = 0.90;
+      p.torsoPitch = 0.18; // combined ~1.08 rad (~62°)
+      p.hipsRoll = clamp(loc.turnRate * 0.08, -0.22, 0.22);
+      p.torsoRoll = clamp(loc.turnRate * 0.06, -0.18, 0.18);
+      p.neckPitch = -0.44;
+      p.headPitch = -0.50 + Math.max(0, s) * 0.08; // keeps chin & eyes above surface
+      p.clavLShrug = 0.12 - c * 0.06;
+      p.clavRShrug = 0.12 - c * 0.06;
+
+      // Synchronized breaststroke: forward glide (-2.50) -> wide outward sweep (roll ±1.32) -> chest tuck (-0.94)
+      p.armLPitch = -1.72 - c * 0.78 - s * 0.18;
+      p.armRPitch = p.armLPitch;
+      p.armLRoll = 0.76 + s * 0.56;
+      p.armRRoll = -p.armLRoll;
+      p.armLYaw = -0.18 - s * 0.24;
+      p.armRYaw = -p.armLYaw;
+      p.forearmLPitch = -0.82 + c * 0.58 - s * 0.14;
+      p.forearmRPitch = p.forearmLPitch;
+      p.wristLPitch = s * 0.22;
+      p.wristRPitch = s * 0.22;
+      p.wristLRoll = -s * 0.26;
+      p.wristRRoll = s * 0.26;
+      p.fingerLCurl = -0.16; // flat open paddling hands
+      p.fingerRCurl = -0.16;
+    } else if (activeBase === 'SwimSprint') {
+      // Sleek horizontal front-crawl (~80° = 1.40 rad), rapid alternating overhead strokes & side breath turns
+      const pL = this._swimPhase;
+      const pR = this._swimPhase + Math.PI;
+      const bodyRoll = Math.sin(pL) * 0.24;
+      p.hipsY = this._hipBindY - 0.28 + Math.sin(pL * 2.0) * 0.025;
+      p.hipsPitch = 1.24;
+      p.torsoPitch = 0.16; // combined ~1.40 rad (~80°)
+      p.hipsRoll = bodyRoll;
+      p.torsoRoll = bodyRoll * 0.9 + clamp(loc.turnRate * 0.07, -0.22, 0.22);
+      p.torsoYaw = -Math.sin(pL) * 0.14;
+
+      // Subtle alternating side-to-side head breath turns every second stroke
+      const breathWave = Math.sin(pL * 0.5);
+      const breathTurn = Math.pow(Math.abs(breathWave), 2.2) * Math.sign(breathWave);
+      p.neckPitch = -0.52;
+      p.headPitch = -0.44;
+      p.headYaw = breathTurn * 0.62;
+      p.headRoll = -breathTurn * 0.26;
+      p.clavLShrug = 0.14 + Math.max(0, Math.cos(pL)) * 0.12;
+      p.clavRShrug = 0.14 + Math.max(0, Math.cos(pR)) * 0.12;
+
+      // Rapid alternating front-crawl overhead reaching & deep underwater pull
+      p.armLPitch = -1.54 - Math.cos(pL) * 1.28;
+      p.armRPitch = -1.54 - Math.cos(pR) * 1.28;
+      p.armLRoll = 0.52 - Math.sin(pL) * 0.42 + Math.max(0, -Math.sin(pL)) * 0.36;
+      p.armRRoll = -(0.52 - Math.sin(pR) * 0.42 + Math.max(0, -Math.sin(pR)) * 0.36);
+      p.armLYaw = -0.12 + Math.sin(pL) * 0.18;
+      p.armRYaw = 0.12 - Math.sin(pR) * 0.18;
+      p.forearmLPitch = -0.66 + Math.cos(pL) * 0.44 - Math.max(0, Math.sin(pL)) * 0.38;
+      p.forearmRPitch = -0.66 + Math.cos(pR) * 0.44 - Math.max(0, Math.sin(pR)) * 0.38;
+      p.wristLPitch = Math.sin(pL) * 0.22;
+      p.wristRPitch = Math.sin(pR) * 0.22;
+      p.fingerLCurl = -0.14;
+      p.fingerRCurl = -0.14;
+      p.jawOpen = Math.abs(breathTurn) * 0.24;
+      p.eyeSquint = 0.2;
+    } else if (activeBase === 'SwimDive') {
+      // Sleek underwater dive tilting smoothly nose-down on descent (C) & nose-up on ascent (Space)
+      const sw = this._swimPhase;
+      const c = Math.cos(sw);
+      const s = Math.sin(sw);
+      const diveTilt = clamp(-loc.verticalSwimVel * 0.24, -0.68, 0.68);
+      const undulate = Math.sin(sw);
+      p.hipsY = this._hipBindY - 0.30 + Math.sin(sw * 1.2) * 0.032;
+      p.hipsPitch = 1.32 + diveTilt * 0.85 + undulate * 0.08;
+      p.torsoPitch = 0.14 + diveTilt * 0.15 - Math.sin(sw - 0.7) * 0.12;
+      p.hipsRoll = clamp(loc.turnRate * 0.12, -0.32, 0.32);
+      p.torsoRoll = clamp(loc.turnRate * 0.1, -0.26, 0.26);
+      p.neckPitch = -0.30 - diveTilt * 0.12;
+      p.headPitch = -0.28 - diveTilt * 0.08;
+      p.clavLShrug = 0.12;
+      p.clavRShrug = 0.12;
+
+      // Graceful long underwater breaststroke sweeps
+      p.armLPitch = -1.78 - c * 0.92 - s * 0.15;
+      p.armRPitch = p.armLPitch;
+      p.armLRoll = 0.72 + s * 0.62;
+      p.armRRoll = -p.armLRoll;
+      p.armLYaw = -0.16 - s * 0.2;
+      p.armRYaw = -p.armLYaw;
+      p.forearmLPitch = -0.58 + c * 0.42 - Math.max(0, -c) * 0.35;
+      p.forearmRPitch = p.forearmLPitch;
+      p.wristLPitch = s * 0.24;
+      p.wristRPitch = s * 0.24;
+      p.fingerLCurl = -0.16;
+      p.fingerRCurl = -0.16;
+      p.eyeSquint = 0.24;
+    }
+
+    // Playable Character Emotes (1..4) blended smoothly over relaxed Idle when active
+    if (this._emoteName && this._emoteTimer >= 0 && !this._panicActive && this._slipTimer < 0) {
+      this._applyEmoteToTargetPose(p, this._emoteName, this._emoteTimer, this._emoteDuration);
     }
 
     // Aerodynamic squint to eyelids & brows during FullSprint or strong forest wind
     // (suppressed during wide-eyed terror in RatPanicShake Stage 1-2!)
     const inShockTerror = this._panicActive && (this._panicStage === 1 || this._panicStage === 2);
-    if (!inShockTerror) {
+    if (!inShockTerror && !loc.swimming) {
       const sprintSquint =
         activeBase === 'FullSprint' ? clamp((speedRatio - 0.55) / 0.45, 0, 1) * 0.34 : 0;
       const windSquint = smoothstep(0.75, 2.5, loc.windIntensity) * 0.32;
@@ -1126,63 +1595,204 @@ export class HumanAnimatorIK {
     return p;
   }
 
+  _applyEmoteToTargetPose(p, name, t, dur) {
+    if (name === 'EmoteWave') {
+      // 1 (2.6s): Cheerful elevated right-hand overhead wave, friendly head tilt & relaxed brows
+      const env = smoothstep(0.0, 0.28, t) * (1.0 - smoothstep(dur - 0.38, dur, t));
+      const wave = Math.sin(t * 9.8);
+      p.hipsX = lerp(p.hipsX, -0.024, env);
+      p.hipsRoll = lerp(p.hipsRoll, 0.035, env);
+      p.torsoRoll = lerp(p.torsoRoll, -0.055 + wave * 0.024, env);
+      p.torsoYaw = lerp(p.torsoYaw, 0.08, env);
+      p.headRoll = lerp(p.headRoll, 0.14 + wave * 0.032, env);
+      p.headPitch = lerp(p.headPitch, -0.06, env);
+      p.headYaw = lerp(p.headYaw, 0.04, env);
+      p.clavRShrug = lerp(p.clavRShrug, 0.22, env);
+      p.armRPitch = lerp(p.armRPitch, -2.42, env);
+      p.armRRoll = lerp(p.armRRoll, -0.78 + wave * 0.26, env);
+      p.armRYaw = lerp(p.armRYaw, 0.22, env);
+      p.forearmRPitch = lerp(p.forearmRPitch, -0.68 + wave * 0.22, env);
+      p.wristRPitch = lerp(p.wristRPitch, -0.14 + wave * 0.18, env);
+      p.wristRRoll = lerp(p.wristRRoll, wave * 0.44, env);
+      p.fingerRCurl = lerp(p.fingerRCurl, -0.22, env); // wide-open friendly 5-finger splay
+      p.armLRoll = lerp(p.armLRoll, 0.2, env);
+      p.forearmLPitch = lerp(p.forearmLPitch, -0.4, env);
+      p.browHeight = lerp(p.browHeight, 0.005, env);
+      p.browTilt = lerp(p.browTilt, 0.04, env);
+      p.eyeSquint = lerp(p.eyeSquint, 0.08, env);
+    } else if (name === 'EmoteWarmHands') {
+      // 2 (3.6s): Slight forward lean, briskly rubbing palms together warming hands -> overhead shoulder stretch!
+      const warmEnv = smoothstep(0.0, 0.3, t) * (1.0 - smoothstep(2.1, 2.52, t));
+      const stretchEnv = smoothstep(2.28, 2.7, t) * (1.0 - smoothstep(dur - 0.38, dur, t));
+      const rub = Math.sin(t * 22.0);
+
+      if (warmEnv > 0.001) {
+        p.hipsY = lerp(p.hipsY, this._hipBindY - 0.045, warmEnv);
+        p.torsoPitch = lerp(p.torsoPitch, 0.22, warmEnv);
+        p.neckPitch = lerp(p.neckPitch, 0.08, warmEnv);
+        p.headPitch = lerp(p.headPitch, 0.16, warmEnv);
+        p.headYaw = lerp(p.headYaw, 0, warmEnv);
+        p.clavLShrug = lerp(p.clavLShrug, 0.08, warmEnv);
+        p.clavRShrug = lerp(p.clavRShrug, 0.08, warmEnv);
+        p.armLPitch = lerp(p.armLPitch, -0.68 + rub * 0.09, warmEnv);
+        p.armRPitch = lerp(p.armRPitch, -0.68 - rub * 0.09, warmEnv);
+        p.armLRoll = lerp(p.armLRoll, 0.24, warmEnv);
+        p.armRRoll = lerp(p.armRRoll, -0.24, warmEnv);
+        p.armLYaw = lerp(p.armLYaw, -0.58, warmEnv);
+        p.armRYaw = lerp(p.armRYaw, 0.58, warmEnv);
+        p.forearmLPitch = lerp(p.forearmLPitch, -1.58 + rub * 0.14, warmEnv);
+        p.forearmRPitch = lerp(p.forearmRPitch, -1.58 - rub * 0.14, warmEnv);
+        p.wristLPitch = lerp(p.wristLPitch, rub * 0.24, warmEnv);
+        p.wristRPitch = lerp(p.wristRPitch, -rub * 0.24, warmEnv);
+        p.wristLRoll = lerp(p.wristLRoll, -0.35 + rub * 0.22, warmEnv);
+        p.wristRRoll = lerp(p.wristRRoll, 0.35 + rub * 0.22, warmEnv);
+        p.fingerLCurl = lerp(p.fingerLCurl, -0.08, warmEnv);
+        p.fingerRCurl = lerp(p.fingerRCurl, -0.08, warmEnv);
+      }
+
+      if (stretchEnv > 0.001) {
+        p.hipsY = lerp(p.hipsY, this._hipBindY + 0.008, stretchEnv);
+        p.torsoPitch = lerp(p.torsoPitch, -0.14, stretchEnv);
+        p.neckPitch = lerp(p.neckPitch, -0.08, stretchEnv);
+        p.headPitch = lerp(p.headPitch, -0.16, stretchEnv);
+        p.clavLShrug = lerp(p.clavLShrug, 0.28, stretchEnv);
+        p.clavRShrug = lerp(p.clavRShrug, 0.28, stretchEnv);
+        p.armLPitch = lerp(p.armLPitch, -2.68, stretchEnv);
+        p.armRPitch = lerp(p.armRPitch, -2.68, stretchEnv);
+        p.armLRoll = lerp(p.armLRoll, 0.34, stretchEnv);
+        p.armRRoll = lerp(p.armRRoll, -0.34, stretchEnv);
+        p.armLYaw = lerp(p.armLYaw, 0.06, stretchEnv);
+        p.armRYaw = lerp(p.armRYaw, -0.06, stretchEnv);
+        p.forearmLPitch = lerp(p.forearmLPitch, -0.36, stretchEnv);
+        p.forearmRPitch = lerp(p.forearmRPitch, -0.36, stretchEnv);
+        p.fingerLCurl = lerp(p.fingerLCurl, -0.16, stretchEnv);
+        p.fingerRCurl = lerp(p.fingerRCurl, -0.16, stretchEnv);
+        p.jawOpen = lerp(p.jawOpen, 0.1, stretchEnv);
+      }
+    } else if (name === 'EmoteCompass') {
+      // 3 (3.2s): Left forearm inspecting palm compass, right hand thoughtful on chin/hip, head scanning valley L/R
+      const env = smoothstep(0.0, 0.28, t) * (1.0 - smoothstep(dur - 0.38, dur, t));
+      const scanYaw = Math.sin(clamp((t - 0.52) / 2.25, 0, 1) * TWO_PI) * 0.64 * env;
+      const lookDown = clamp(1.0 - smoothstep(0.62, 1.05, t) + smoothstep(2.35, 2.72, t), 0, 1);
+
+      p.torsoPitch = lerp(p.torsoPitch, 0.06, env);
+      p.torsoYaw = lerp(p.torsoYaw, scanYaw * 0.2, env);
+      p.neckYaw = lerp(p.neckYaw, scanYaw * 0.24, env);
+      p.headYaw = lerp(p.headYaw, scanYaw * 0.76, env);
+      p.eyeYaw = lerp(p.eyeYaw, scanYaw * 0.26, env);
+      p.headPitch = lerp(p.headPitch, lerp(-0.04, 0.32, lookDown), env);
+      p.eyePitch = lerp(p.eyePitch, lookDown * 0.14, env);
+
+      // Left palm held up near chest reading compass
+      p.armLPitch = lerp(p.armLPitch, -0.58, env);
+      p.armLRoll = lerp(p.armLRoll, 0.18, env);
+      p.armLYaw = lerp(p.armLYaw, -0.48, env);
+      p.forearmLPitch = lerp(p.forearmLPitch, -1.68, env);
+      p.wristLPitch = lerp(p.wristLPitch, 0.24, env);
+      p.wristLRoll = lerp(p.wristLRoll, -0.65, env);
+      p.fingerLCurl = lerp(p.fingerLCurl, 0.04, env);
+
+      // Right hand raised thoughtfully toward chin
+      p.armRPitch = lerp(p.armRPitch, -0.78, env);
+      p.armRRoll = lerp(p.armRRoll, -0.22, env);
+      p.armRYaw = lerp(p.armRYaw, 0.42, env);
+      p.forearmRPitch = lerp(p.forearmRPitch, -1.92, env);
+      p.wristRPitch = lerp(p.wristRPitch, -0.18, env);
+      p.fingerRCurl = lerp(p.fingerRCurl, 0.58, env);
+
+      p.browTilt = lerp(p.browTilt, -0.06, env);
+      p.eyeSquint = lerp(p.eyeSquint, 0.08, env);
+    } else if (name === 'EmoteVictory') {
+      // 4 (3.4s): Playful rhythmic victory groove — bouncy knee groove, hip sway, alternating overhead fist-pumps & nod
+      const env = smoothstep(0.0, 0.22, t) * (1.0 - smoothstep(dur - 0.38, dur, t));
+      const beat = t * 2.35 * TWO_PI;
+      const grooveBounce = 0.5 - 0.5 * Math.cos(beat * 2.0);
+      const sway = Math.sin(beat);
+      const pumpL = Math.max(0, sway);
+      const pumpR = Math.max(0, -sway);
+
+      p.hipsY = lerp(p.hipsY, this._hipBindY - 0.115 + grooveBounce * 0.098, env);
+      p.hipsX = lerp(p.hipsX, sway * 0.062, env);
+      p.hipsRoll = lerp(p.hipsRoll, -sway * 0.095, env);
+      p.hipsYaw = lerp(p.hipsYaw, sway * 0.16, env);
+      p.torsoRoll = lerp(p.torsoRoll, sway * 0.11, env);
+      p.torsoYaw = lerp(p.torsoYaw, -sway * 0.2, env);
+      p.torsoPitch = lerp(p.torsoPitch, -0.04 + grooveBounce * 0.08, env);
+      p.headPitch = lerp(p.headPitch, -0.08 + Math.sin(beat * 2.0) * 0.16, env);
+      p.headRoll = lerp(p.headRoll, sway * 0.1, env);
+      p.headYaw = lerp(p.headYaw, 0, env);
+
+      p.clavLShrug = lerp(p.clavLShrug, 0.12 + pumpL * 0.22, env);
+      p.clavRShrug = lerp(p.clavRShrug, 0.12 + pumpR * 0.22, env);
+      p.armLPitch = lerp(p.armLPitch, -1.35 - pumpL * 1.25, env);
+      p.armRPitch = lerp(p.armRPitch, -1.35 - pumpR * 1.25, env);
+      p.armLRoll = lerp(p.armLRoll, 0.42 + pumpL * 0.28, env);
+      p.armRRoll = lerp(p.armRRoll, -(0.42 + pumpR * 0.28), env);
+      p.forearmLPitch = lerp(p.forearmLPitch, -1.48 + pumpL * 0.88, env);
+      p.forearmRPitch = lerp(p.forearmRPitch, -1.48 + pumpR * 0.88, env);
+      p.fingerLCurl = lerp(p.fingerLCurl, 1.28, env);
+      p.fingerRCurl = lerp(p.fingerRCurl, 1.28, env);
+
+      p.browHeight = lerp(p.browHeight, 0.006, env);
+      p.jawOpen = lerp(p.jawOpen, 0.1, env);
+      p.eyeSquint = lerp(p.eyeSquint, 0.1, env);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // High-Frequency Expressive Overlays (RatPanicShake 4 Stages, Slip, Thunder)
   // ---------------------------------------------------------------------------
 
-  _computeExpressiveOverlays(dt, elapsed, loc, pendingFootsteps) {
-    const ov = {
-      hipsX: 0,
-      hipsY: 0,
-      hipsZ: 0,
-      hipsPitch: 0,
-      hipsYaw: 0,
-      hipsRoll: 0,
-      torsoPitch: 0,
-      torsoYaw: 0,
-      torsoRoll: 0,
-      neckPitch: 0,
-      neckYaw: 0,
-      headPitch: 0,
-      headYaw: 0,
-      headRoll: 0,
-      clavLShrug: 0,
-      clavRShrug: 0,
-      // Additive or override arm channels (blend 0..1 overrides smoothed arm angles crisply)
-      armOverrideWeight: 0,
-      armLPitch: 0,
-      armLRoll: 0,
-      armLYaw: 0,
-      forearmLPitch: 0,
-      wristLPitch: 0,
-      wristLRoll: 0,
-      fingerLCurl: 0,
-      armRPitch: 0,
-      armRRoll: 0,
-      armRYaw: 0,
-      forearmRPitch: 0,
-      wristRPitch: 0,
-      wristRRoll: 0,
-      fingerRCurl: 0,
-      // Additive shiver micro-tremors (Stage 3-4)
-      shiverWrist: 0,
-      shiverForearm: 0,
-      shiverShoulder: 0,
-      shiverKnee: 0,
-      // Facial additive overrides
-      jawOpen: 0,
-      browHeight: 0,
-      browTilt: 0,
-      eyeWide: 0,
-      eyeSquint: 0,
-      eyeYaw: 0,
-      eyePitch: 0,
-      // Leg IK weight targets & FK overrides
-      ikTargetL: loc.grounded ? 1.0 : 0.0,
-      ikTargetR: loc.grounded ? 1.0 : 0.0,
-      panicShakeLeg: null, // { side, thighX, thighY, thighZ, shinX, ankleX, ankleZ }
-      slipKick: 0,
-    };
+  _computeExpressiveOverlays(dt, elapsed, loc) {
+    const ov = this._overlayScratch;
+    const groundIK = loc.grounded && !loc.swimming ? 1.0 : 0.0;
+
+    ov.hipsX = 0;
+    ov.hipsY = 0;
+    ov.hipsZ = 0;
+    ov.hipsPitch = 0;
+    ov.hipsYaw = 0;
+    ov.hipsRoll = 0;
+    ov.torsoPitch = 0;
+    ov.torsoYaw = 0;
+    ov.torsoRoll = 0;
+    ov.neckPitch = 0;
+    ov.neckYaw = 0;
+    ov.headPitch = 0;
+    ov.headYaw = 0;
+    ov.headRoll = 0;
+    ov.clavLShrug = 0;
+    ov.clavRShrug = 0;
+    ov.armOverrideWeight = 0;
+    ov.armLPitch = 0;
+    ov.armLRoll = 0;
+    ov.armLYaw = 0;
+    ov.forearmLPitch = 0;
+    ov.wristLPitch = 0;
+    ov.wristLRoll = 0;
+    ov.fingerLCurl = 0;
+    ov.armRPitch = 0;
+    ov.armRRoll = 0;
+    ov.armRYaw = 0;
+    ov.forearmRPitch = 0;
+    ov.wristRPitch = 0;
+    ov.wristRRoll = 0;
+    ov.fingerRCurl = 0;
+    ov.shiverWrist = 0;
+    ov.shiverForearm = 0;
+    ov.shiverShoulder = 0;
+    ov.shiverKnee = 0;
+    ov.jawOpen = 0;
+    ov.browHeight = 0;
+    ov.browTilt = 0;
+    ov.eyeWide = 0;
+    ov.eyeSquint = 0;
+    ov.eyeYaw = 0;
+    ov.eyePitch = 0;
+    ov.ikTargetL = groundIK;
+    ov.ikTargetR = groundIK;
+    ov.panicShakeLeg = null;
+    ov.slipKick = 0;
 
     // 1. Thunder Flinch (0.85s): shoulder hunch toward ears, knee flinch, head whips up toward sky
     if (this._thunderTimer >= 0) {
@@ -1305,7 +1915,7 @@ export class HumanAnimatorIK {
 
         // Trigger shock landing thud at end of Stage 1
         if (u > 0.92 && this._prevHopSin <= 0.92) {
-          pendingFootsteps.push({ side: this._panicSide === 'L' ? 'R' : 'L', intensity: 0.65 });
+          this._pushPendingFootstep(this._panicSide === 'L' ? 'R' : 'L', 0.65);
         }
         this._prevHopSin = u;
       } else if (this._panicStage === 2) {
@@ -1368,21 +1978,21 @@ export class HumanAnimatorIK {
 
           if (this._panicSide === 'L') {
             ov.ikTargetL = 0.0;
-            ov.ikTargetR = loc.grounded ? 1.0 : 0.0;
+            ov.ikTargetR = groundIK;
           } else {
             ov.ikTargetR = 0.0;
-            ov.ikTargetL = loc.grounded ? 1.0 : 0.0;
+            ov.ikTargetL = groundIK;
           }
 
-          ov.panicShakeLeg = {
-            side: this._panicSide,
-            thighX: -0.72 + tremor14 * 0.24,
-            thighY: sAff * 0.14 + tremor14 * 0.22,
-            thighZ: sAff * 0.22 + tremor14Quad * 0.16,
-            shinX: clamp(0.62 + tremor14 * 0.36, 0.1, 1.55),
-            ankleX: 0.18 + tremor14Quad * 0.42,
-            ankleZ: tremor14 * 0.34,
-          };
+          const pl = this._panicLegScratch;
+          pl.side = this._panicSide;
+          pl.thighX = -0.72 + tremor14 * 0.24;
+          pl.thighY = sAff * 0.14 + tremor14 * 0.22;
+          pl.thighZ = sAff * 0.22 + tremor14Quad * 0.16;
+          pl.shinX = clamp(0.62 + tremor14 * 0.36, 0.1, 1.55);
+          pl.ankleX = 0.18 + tremor14Quad * 0.42;
+          pl.ankleZ = tremor14 * 0.34;
+          ov.panicShakeLeg = pl;
 
           // Both hands frantically slap / brush downward at affected shin (~8 Hz alternating swipes!)
           const swipePhase = stageT * 8.0 * TWO_PI;
@@ -1447,16 +2057,11 @@ export class HumanAnimatorIK {
 
         // Sharp paranoid left / right / down grass-checking snaps during Stage 3
         const stepIdx = Math.floor((pt - 2.4) / 0.62);
-        const lookTable = [
-          { y: 0.68, p: 0.25 },   // sharp left
-          { y: -0.72, p: 0.28 },  // sharp right
-          { y: 0.05, p: 0.62 },   // straight down at boots
-          { y: -0.52, p: 0.48 },  // down-right grass
-          { y: 0.62, p: 0.44 },   // down-left grass
-          { y: 0.0, p: 0.58 },    // check boots again
-          { y: -0.66, p: 0.18 },  // sharp right behind shoulder
-        ];
-        const targetLook = lookTable[((stepIdx % lookTable.length) + lookTable.length) % lookTable.length];
+        const targetLook =
+          PARANOID_LOOK_TABLE[
+            ((stepIdx % PARANOID_LOOK_TABLE.length) + PARANOID_LOOK_TABLE.length) %
+              PARANOID_LOOK_TABLE.length
+          ];
         const snapRate = 1.0 - Math.exp(-dt * 17.5);
         this._paranoidYaw = lerp(this._paranoidYaw, targetLook.y * decay, snapRate);
         this._paranoidPitch = lerp(this._paranoidPitch, targetLook.p * decay, snapRate);
@@ -1549,28 +2154,31 @@ export class HumanAnimatorIK {
     const upperLidAngle = blinkAmt * 0.62 + eyeSquint * 0.22 - eyeWide * 0.85;
     const lowerLidAngle = -blinkAmt * 0.14 - eyeSquint * 0.16 + eyeWide * 0.55;
 
-    b.upperLidL.rotation.x = clamp(upperLidAngle, -0.38, 0.65);
-    b.upperLidR.rotation.x = clamp(upperLidAngle, -0.38, 0.65);
-    b.lowerLidL.rotation.x = clamp(lowerLidAngle, -0.22, 0.28);
-    b.lowerLidR.rotation.x = clamp(lowerLidAngle, -0.22, 0.28);
+    if (b.upperLidL) b.upperLidL.rotation.x = clamp(upperLidAngle, -0.38, 0.65);
+    if (b.upperLidR) b.upperLidR.rotation.x = clamp(upperLidAngle, -0.38, 0.65);
+    if (b.lowerLidL) b.lowerLidL.rotation.x = clamp(lowerLidAngle, -0.22, 0.28);
+    if (b.lowerLidR) b.lowerLidR.rotation.x = clamp(lowerLidAngle, -0.22, 0.28);
 
     const eyeYaw = clamp(s.eyeYaw + ov.eyeYaw, -0.35, 0.35);
     const eyePitch = clamp(s.eyePitch + ov.eyePitch, -0.28, 0.32);
-    b.eyeL.rotation.set(eyePitch, eyeYaw, 0);
-    b.eyeR.rotation.set(eyePitch, eyeYaw, 0);
+    if (b.eyeL) b.eyeL.rotation.set(eyePitch, eyeYaw, 0);
+    if (b.eyeR) b.eyeR.rotation.set(eyePitch, eyeYaw, 0);
 
     const browH = clamp(s.browHeight + ov.browHeight, -0.007, 0.018);
     const browT = clamp(s.browTilt + ov.browTilt, -0.32, 0.34);
-    b.browL.position.y = this._browBaseY + browH;
-    b.browR.position.y = this._browBaseY + browH;
-    // Inner-up horror vs inner-down furrowed brow tilt
-    b.browL.rotation.z = -browT;
-    b.browR.rotation.z = browT;
+    if (b.browL) {
+      b.browL.position.y = this._browBaseY + browH;
+      b.browL.rotation.z = -browT;
+    }
+    if (b.browR) {
+      b.browR.position.y = this._browBaseY + browH;
+      b.browR.rotation.z = browT;
+    }
 
     const jawOpen = clamp(s.jawOpen + ov.jawOpen, 0, 0.58);
-    b.jaw.rotation.x = jawOpen;
+    if (b.jaw) b.jaw.rotation.x = jawOpen;
 
-    // 5. Clavicles, Arms, Wrists & Articulated Fingers (clenched sprint fists vs splayed panic hands)
+    // 5. Clavicles, Arms, Wrists & Articulated Fingers (clenched sprint fists vs splayed panic/swim hands)
     const shivS = ov.shiverShoulder;
     const shivF = ov.shiverForearm;
     const shivW = ov.shiverWrist;
@@ -1604,13 +2212,13 @@ export class HumanAnimatorIK {
     b.forearmR.rotation.set(clamp(foreRP, -2.15, -0.04), 0, 0);
     b.wristR.rotation.set(wristRP, s.wristRYaw, wristRR);
 
-    // Articulate all 5 digits per hand (relaxed idle curl, tight sprint fist, wide-splayed panic fingers)
+    // Articulate all 5 digits per hand (relaxed idle curl, tight sprint fist, wide-splayed panic/swim fingers)
     const splayL = fingerLC < 0 ? clamp(-fingerLC / 0.32, 0, 1) : 0;
     const splayR = fingerRC < 0 ? clamp(-fingerRC / 0.32, 0, 1) : 0;
     if (typeof this.rig.setHandPose === 'function') {
       this.rig.setHandPose('L', fingerLC, splayL);
       this.rig.setHandPose('R', fingerRC, splayR);
-    } else {
+    } else if (b.fingersL && b.fingersR) {
       // Fallback for legacy single-bone finger rigs
       b.fingersL.rotation.set(0, 0, -fingerLC);
       b.fingersR.rotation.set(0, 0, fingerRC);
@@ -1624,7 +2232,7 @@ export class HumanAnimatorIK {
   _applyLegsAndFootIK(dt, elapsed, loc, baseLocoState, stride, ov, landingComp) {
     const b = this.bones;
 
-    // Smoothly blend per-leg Foot IK weight (0 during airborne Jump / RatPanicShake Stage 2 shake, 1 grounded)
+    // Smoothly blend per-leg Foot IK weight (0 during swimming / Jump / RatPanicShake Stage 2 shake, 1 grounded/wading)
     const ikFadeIn = 1.0 - Math.exp(-dt * 14.0);
     const ikFadeOut = 1.0 - Math.exp(-dt * 22.0);
     this._ikWeightL = lerp(
@@ -1637,6 +2245,8 @@ export class HumanAnimatorIK {
       ov.ikTargetR,
       ov.ikTargetR > this._ikWeightR ? ikFadeIn : ikFadeOut
     );
+    if (ov.ikTargetL === 0 && this._ikWeightL < 0.008) this._ikWeightL = 0;
+    if (ov.ikTargetR === 0 && this._ikWeightR < 0.008) this._ikWeightR = 0;
 
     // 1. Compute desired local foot XZ targets for each leg
     let fxLocalL = stride.left.x;
@@ -1749,60 +2359,110 @@ export class HumanAnimatorIK {
     this._invHipsLocalMat.copy(this._hipsLocalMat).invert();
     this._hipsQuat.setFromEuler(b.hips.rotation);
 
-    // 4. Compute procedural FK fallback poses for airborne Jump, SlipRecovery kick, and RatPanicShake Stage 2!
-    const fkL = this._computeFKLegPose('L', elapsed, loc, ov);
-    const fkR = this._computeFKLegPose('R', elapsed, loc, ov);
+    // 4. Compute procedural FK fallback poses for swimming, Jump, SlipRecovery kick, and RatPanicShake Stage 2!
+    const fkL = this._computeFKLegPose('L', elapsed, loc, baseLocoState, ov, this._fkLegLScratch);
+    const fkR = this._computeFKLegPose('R', elapsed, loc, baseLocoState, ov, this._fkLegRScratch);
 
     // 5. Solve analytical 2-bone IK for each leg and blend cleanly with FK via ikWeight!
     this._solveLegIK('L', this._ankleTargetL, this._normalLocalL, anklePitchL, this._ikWeightL, fkL, ov.shiverKnee);
     this._solveLegIK('R', this._ankleTargetR, this._normalLocalR, anklePitchR, this._ikWeightR, fkR, -ov.shiverKnee);
 
-    // 6. Articulated forefoot toe pitch (bend cleanly upward on push-off, relax in air)
-    b.toeL.rotation.set(toeBendL * this._ikWeightL, 0, 0);
-    b.toeR.rotation.set(toeBendR * this._ikWeightR, 0, 0);
+    // 6. Articulated forefoot toe pitch (bend cleanly upward on push-off, relax in air/water)
+    if (b.toeL) b.toeL.rotation.set(toeBendL * this._ikWeightL, 0, 0);
+    if (b.toeR) b.toeR.rotation.set(toeBendR * this._ikWeightR, 0, 0);
   }
 
-  _computeFKLegPose(side, elapsed, loc, ov) {
+  _computeFKLegPose(side, elapsed, loc, baseLocoState, ov, out) {
     const s = side === 'L' ? 1 : -1;
 
     // Stage 2 RatPanicShake violent 14 Hz leg shake on affected side
     if (ov.panicShakeLeg && ov.panicShakeLeg.side === side) {
-      return {
-        thighX: ov.panicShakeLeg.thighX,
-        thighY: ov.panicShakeLeg.thighY,
-        thighZ: ov.panicShakeLeg.thighZ,
-        shinX: ov.panicShakeLeg.shinX,
-        ankleX: ov.panicShakeLeg.ankleX,
-        ankleY: 0,
-        ankleZ: ov.panicShakeLeg.ankleZ,
-      };
+      out.thighX = ov.panicShakeLeg.thighX;
+      out.thighY = ov.panicShakeLeg.thighY;
+      out.thighZ = ov.panicShakeLeg.thighZ;
+      out.shinX = ov.panicShakeLeg.shinX;
+      out.ankleX = ov.panicShakeLeg.ankleX;
+      out.ankleY = 0;
+      out.ankleZ = ov.panicShakeLeg.ankleZ;
+      return out;
     }
 
     // Stage 1 Electro-Shock involuntary mini-hop tuck
     if (this._panicActive && this._panicStage === 1) {
-      return {
-        thighX: -0.42,
-        thighY: s * 0.08,
-        thighZ: s * 0.14,
-        shinX: 0.78,
-        ankleX: 0.25,
-        ankleY: 0,
-        ankleZ: 0,
-      };
+      out.thighX = -0.42;
+      out.thighY = s * 0.08;
+      out.thighZ = s * 0.14;
+      out.shinX = 0.78;
+      out.ankleX = 0.25;
+      out.ankleY = 0;
+      out.ankleZ = 0;
+      return out;
     }
 
     // SlipRecovery comedic forward foot kick
     if (ov.slipKick > 0.05) {
       const lead = side === 'L' ? 1.0 : 0.45;
-      return {
-        thighX: -0.78 * ov.slipKick * lead,
-        thighY: s * 0.06,
-        thighZ: s * 0.12 * ov.slipKick,
-        shinX: 0.24 * ov.slipKick,
-        ankleX: -0.25 * ov.slipKick,
-        ankleY: 0,
-        ankleZ: 0,
-      };
+      out.thighX = -0.78 * ov.slipKick * lead;
+      out.thighY = s * 0.06;
+      out.thighZ = s * 0.12 * ov.slipKick;
+      out.shinX = 0.24 * ov.slipKick;
+      out.ankleX = -0.25 * ov.slipKick;
+      out.ankleY = 0;
+      out.ankleZ = 0;
+      return out;
+    }
+
+    // Swimming & Diving FK leg kicks (zero ground IK interference!)
+    if (loc.swimming) {
+      const sw = this._swimPhase;
+      if (baseLocoState === 'SwimTread') {
+        // Gentle alternating frog / bicycle leg kicks keeping head safely above water
+        const kickP = sw * 1.15 + (side === 'L' ? 0 : Math.PI);
+        out.thighX = -0.46 + Math.sin(kickP) * 0.38;
+        out.thighY = s * 0.08;
+        out.thighZ = s * (0.2 + Math.max(0, -Math.sin(kickP)) * 0.16);
+        out.shinX = clamp(0.78 + Math.cos(kickP) * 0.48, 0.12, 1.65);
+        out.ankleX = 0.32 + Math.sin(kickP - 0.5) * 0.26;
+        out.ankleY = 0;
+        out.ankleZ = 0;
+        return out;
+      }
+      if (baseLocoState === 'SwimStroke') {
+        // Synchronized rhythmic breaststroke frog kick (timed against arm pull)
+        const kp = sw - 0.9;
+        const frogTuck = 0.5 - 0.5 * Math.cos(kp);
+        const frogSnap = Math.max(0, Math.sin(kp));
+        out.thighX = -0.14 - frogTuck * 0.74;
+        out.thighY = s * (0.06 + frogTuck * 0.22);
+        out.thighZ = s * (0.08 + frogTuck * 0.42 + frogSnap * 0.15);
+        out.shinX = clamp(0.14 + frogTuck * 1.44, 0.08, 1.75);
+        out.ankleX = lerp(0.54, -0.14, frogTuck);
+        out.ankleY = 0;
+        out.ankleZ = s * frogTuck * 0.12;
+        return out;
+      }
+      if (baseLocoState === 'SwimSprint') {
+        // Energetic 6-beat freestyle flutter kicks
+        const flutterP = sw * 3.0 + (side === 'L' ? 0 : Math.PI);
+        out.thighX = 0.06 + Math.sin(flutterP) * 0.34;
+        out.thighY = s * 0.03;
+        out.thighZ = s * 0.04;
+        out.shinX = clamp(0.22 + Math.max(0, Math.sin(flutterP - 0.7)) * 0.48, 0.08, 1.0);
+        out.ankleX = 0.58 + Math.sin(flutterP - 1.1) * 0.18;
+        out.ankleY = 0;
+        out.ankleZ = 0;
+        return out;
+      }
+      // SwimDive: graceful rhythmic underwater dolphin/breaststroke kicks synced to undulating spine
+      const dk = sw * 1.45 + (side === 'L' ? 0 : 0.35);
+      out.thighX = -0.1 + Math.sin(dk - 0.45) * 0.42;
+      out.thighY = s * 0.05;
+      out.thighZ = s * (0.09 + Math.max(0, -Math.sin(dk)) * 0.22);
+      out.shinX = clamp(0.24 + Math.max(0, Math.sin(dk - 1.15)) * 0.92, 0.1, 1.45);
+      out.ankleX = 0.56 + Math.sin(dk - 1.45) * 0.22;
+      out.ankleY = 0;
+      out.ankleZ = 0;
+      return out;
     }
 
     // Jump: launch extension vs mid-air athletic tuck
@@ -1812,15 +2472,14 @@ export class HumanAnimatorIK {
     const shinX = lerp(1.12, 0.34, rising) + (side === 'L' ? 0.12 : -0.08);
     const ankleX = lerp(0.24, 0.38, rising);
 
-    return {
-      thighX,
-      thighY: s * 0.05,
-      thighZ: s * 0.08,
-      shinX: Math.max(0.06, shinX),
-      ankleX,
-      ankleY: 0,
-      ankleZ: 0,
-    };
+    out.thighX = thighX;
+    out.thighY = s * 0.05;
+    out.thighZ = s * 0.08;
+    out.shinX = Math.max(0.06, shinX);
+    out.ankleX = ankleX;
+    out.ankleY = 0;
+    out.ankleZ = 0;
+    return out;
   }
 
   /**
@@ -1950,44 +2609,58 @@ export class HumanAnimatorIK {
       this._panicActive && (this._panicStage === 1 || this._panicStage === 2)
         ? Math.sin(elapsed * 14.0 * TWO_PI) * 0.25
         : 0;
+    const waterDragScale = loc.swimming ? 0.35 : 1.0;
 
     // 1. Backpack spring-damper bounce & tilt
-    const packTargetPitch = clamp(-horizAccel * 0.015 - loc.speed * 0.014, -0.22, 0.22) + panicRattle * 0.16;
-    const packTargetRoll = clamp(loc.turnRate * 0.055 + loc.lateralSpeed * 0.025, -0.22, 0.22);
-    const packTargetBounce = clamp(-hipsAccelY * 0.0018, -0.04, 0.04);
+    const packTargetPitch =
+      clamp(-horizAccel * 0.015 - loc.speed * 0.014, -0.22, 0.22) * waterDragScale + panicRattle * 0.16;
+    const packTargetRoll = clamp(loc.turnRate * 0.055 + loc.lateralSpeed * 0.025, -0.22, 0.22) * waterDragScale;
+    const packTargetBounce = clamp(-hipsAccelY * 0.0018, -0.04, 0.04) * waterDragScale;
 
     const bpPitch = sp.backpackPitch.step(dt, packTargetPitch);
     const bpRoll = sp.backpackRoll.step(dt, packTargetRoll);
     const bpBounce = sp.backpackBounce.step(dt, packTargetBounce);
 
-    b.backpack.position.y = 0.04 + bpBounce;
-    b.backpack.rotation.set(bpPitch, 0, bpRoll);
+    if (b.backpack) {
+      b.backpack.position.y = 0.04 + bpBounce;
+      b.backpack.rotation.set(bpPitch, 0, bpRoll);
+    }
 
     // 2. Hanging aluminum canteen swinging pendulum lag
-    const cantDrivePitch = clamp(-horizAccel * 0.048 - loc.speed * 0.036 - hipsVelY * 0.12 + panicRattle * 1.4, -0.7, 0.7);
-    const cantDriveRoll = clamp(
-      loc.turnRate * 0.16 + loc.lateralSpeed * 0.06 + Math.sin(this._stridePhase) * clamp(loc.speed / 5, 0, 1) * 0.22 + panicRattle * 1.1,
-      -0.7,
-      0.7
-    );
+    const cantDrivePitch =
+      clamp(-horizAccel * 0.048 - loc.speed * 0.036 - hipsVelY * 0.12 + panicRattle * 1.4, -0.7, 0.7) *
+      waterDragScale;
+    const cantDriveRoll =
+      clamp(
+        loc.turnRate * 0.16 +
+          loc.lateralSpeed * 0.06 +
+          Math.sin(this._stridePhase) * clamp(loc.speed / 5, 0, 1) * 0.22 +
+          panicRattle * 1.1,
+        -0.7,
+        0.7
+      ) * waterDragScale;
     const cPitch = sp.canteenPitch.step(dt, cantDrivePitch);
     const cRoll = sp.canteenRoll.step(dt, cantDriveRoll);
-    b.canteen.rotation.set(cPitch, 0, cRoll);
+    if (b.canteen) {
+      b.canteen.rotation.set(cPitch, 0, cRoll);
+    }
 
     // 3. Lower jacket hem trailing flare (streams behind runner, flares on skids/jumps/turns)
     const hemTargetPitch = clamp(
-      loc.forwardSpeed * 0.042 - horizAccel * 0.015 + (loc.grounded ? 0 : 0.24) + Math.abs(ov.hipsY) * 0.5,
+      loc.forwardSpeed * 0.042 - horizAccel * 0.015 + (loc.grounded || loc.swimming ? 0 : 0.24) + Math.abs(ov.hipsY) * 0.5,
       -0.25,
       0.48
     );
     const hemTargetRoll = clamp(loc.turnRate * 0.08 + loc.lateralSpeed * 0.035, -0.32, 0.32);
     const hPitch = sp.jacketHemPitch.step(dt, hemTargetPitch);
     const hRoll = sp.jacketHemRoll.step(dt, hemTargetRoll);
-    b.jacketHem.rotation.set(hPitch, 0, hRoll);
+    if (b.jacketHem) {
+      b.jacketHem.rotation.set(hPitch, 0, hRoll);
+    }
 
     // 4. Swaying front/crown hair locks spring-damper (running momentum, bounce, turns & wind flutter)
     if (b.hairLocks) {
-      const windAmp = clamp(loc.windIntensity, 0, 3.5);
+      const windAmp = clamp(loc.windIntensity, 0, 3.5) * (loc.submerged ? 0.2 : 1.0);
       const windFlutterP =
         Math.sin(elapsed * (3.6 + windAmp * 2.1) + 0.4) * (0.014 + windAmp * 0.048) +
         Math.sin(elapsed * (7.2 + windAmp * 3.0)) * (windAmp * 0.018);
@@ -1998,7 +2671,7 @@ export class HumanAnimatorIK {
         -loc.forwardSpeed * 0.032 -
           horizAccel * 0.012 -
           hipsAccelY * 0.0045 -
-          (loc.grounded ? 0 : clamp(loc.verticalVel * 0.028, -0.18, 0.18)) +
+          (loc.grounded || loc.swimming ? 0 : clamp(loc.verticalVel * 0.028, -0.18, 0.18)) +
           windFlutterP +
           panicRattle * 0.32,
         -0.34,
@@ -2015,8 +2688,8 @@ export class HumanAnimatorIK {
     }
 
     // 5. Head inertial follow-through lag (applied next frame smoothly onto head bone)
-    sp.headLagPitch.step(dt, clamp(-horizAccel * 0.009 - hipsAccelY * 0.0025, -0.18, 0.18));
-    sp.headLagYaw.step(dt, clamp(-loc.turnRate * 0.04, -0.2, 0.2));
-    sp.headLagRoll.step(dt, clamp(loc.turnRate * 0.025, -0.14, 0.14));
+    sp.headLagPitch.step(dt, clamp(-horizAccel * 0.009 - hipsAccelY * 0.0025, -0.18, 0.18) * waterDragScale);
+    sp.headLagYaw.step(dt, clamp(-loc.turnRate * 0.04, -0.2, 0.2) * waterDragScale);
+    sp.headLagRoll.step(dt, clamp(loc.turnRate * 0.025, -0.14, 0.14) * waterDragScale);
   }
 }

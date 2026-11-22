@@ -1,8 +1,15 @@
 import GUI from 'lil-gui';
 import Stats from 'stats.js';
 
+const CHARACTER_OPTIONS = {
+  'Forest Ranger (Liam)': 'liam',
+  'Woodland Archer (Lyra)': 'lyra',
+  'Cyber Scout (Kael)': 'kael',
+  'Wandering Ronin (Kenji)': 'kenji',
+};
+
 /**
- * Interactive lil-gui forest, character, wildlife, structures & mobile controls suite + Stats.js monitor.
+ * Interactive lil-gui forest, character switcher, emotes, wildlife, structures & mobile controls + Stats.js monitor.
  */
 export class ControlPanel {
   constructor(state = {}, callbacks = {}) {
@@ -19,6 +26,7 @@ export class ControlPanel {
     if (this.state.windSpeed === undefined) this.state.windSpeed = 1.0;
     if (this.state.windDirection === undefined) this.state.windDirection = 25;
     if (this.state.gustTurbulence === undefined) this.state.gustTurbulence = 0.55;
+    if (this.state.character === undefined) this.state.character = 'liam';
     if (this.state.cameraMode === undefined) this.state.cameraMode = 'Third-Person';
     if (this.state.sprintSpeed === undefined) this.state.sprintSpeed = 1.0;
     if (this.state.infiniteStamina === undefined) this.state.infiniteStamina = false;
@@ -33,10 +41,18 @@ export class ControlPanel {
     document.body.appendChild(this.stats.dom);
 
     // Collapsible lil-gui Control Panel
-    this.gui = new GUI({ title: 'Forest Controls', width: 282 });
+    this.gui = new GUI({ title: 'Forest Controls', width: 286 });
 
     // 1. Character & Wildlife
     const characterFolder = this.gui.addFolder('Character & Wildlife');
+    characterFolder
+      .add(this.state, 'character', CHARACTER_OPTIONS)
+      .name('Playable Character')
+      .listen()
+      .onChange((value) => {
+        this.callbacks.onCharacterSwitch?.(value, this.state);
+      });
+
     characterFolder
       .add(this.state, 'cameraMode', ['Third-Person', 'First-Person Body', 'Free Orbit'])
       .name('Camera Mode')
@@ -75,28 +91,40 @@ export class ControlPanel {
       });
 
     const wildlifeActions = {
+      nextCharacter: () => this.callbacks.onCycleCharacter?.(),
       triggerRatScare: () => this.callbacks.onTriggerRatScare?.(),
       triggerStreamSlip: () => this.callbacks.onTriggerStreamSlip?.(),
     };
+    characterFolder.add(wildlifeActions, 'nextCharacter').name('Swap Character (Tab)');
     characterFolder.add(wildlifeActions, 'triggerRatScare').name('Trigger Rat Scare (Key: R)');
     characterFolder.add(wildlifeActions, 'triggerStreamSlip').name('Trigger Stream Slip');
 
-    // 2. Explore Structures (quick travel to all 4 walkable interiors/structures)
-    const structuresFolder = this.gui.addFolder('Explore Structures');
+    // 2. Explore Structures & Lagoon
+    const structuresFolder = this.gui.addFolder('Explore & Emotes');
     const travel = {
       clearing: () => this.callbacks.onTeleport?.('clearing'),
       cabinPorch: () => this.callbacks.onTeleport?.('cabinPorch'),
       cabinInterior: () => this.callbacks.onTeleport?.('cabinInterior'),
       bridgeCenter: () => this.callbacks.onTeleport?.('bridgeCenter'),
+      deepLagoon: () => this.callbacks.onTeleport?.('deepLagoon'),
       redwoodInterior: () => this.callbacks.onTeleport?.('redwoodInterior'),
       cavernInterior: () => this.callbacks.onTeleport?.('cavernInterior'),
+      emote1: () => this.callbacks.onEmote?.(1),
+      emote2: () => this.callbacks.onEmote?.(2),
+      emote3: () => this.callbacks.onEmote?.(3),
+      emote4: () => this.callbacks.onEmote?.(4),
     };
     structuresFolder.add(travel, 'cabinPorch').name('Ranger Cabin Porch');
     structuresFolder.add(travel, 'cabinInterior').name('Inside Ranger Cabin');
     structuresFolder.add(travel, 'bridgeCenter').name('Wooden Stream Bridge');
+    structuresFolder.add(travel, 'deepLagoon').name('Deep Swimming Lagoon');
     structuresFolder.add(travel, 'redwoodInterior').name('Inside Hollow Redwood');
     structuresFolder.add(travel, 'cavernInterior').name('Inside Stone Cavern');
     structuresFolder.add(travel, 'clearing').name('Campfire Clearing');
+    structuresFolder.add(travel, 'emote1').name('Emote 1: Wave');
+    structuresFolder.add(travel, 'emote2').name('Emote 2: Warm Hands');
+    structuresFolder.add(travel, 'emote3').name('Emote 3: Compass');
+    structuresFolder.add(travel, 'emote4').name('Emote 4: Victory Groove');
     structuresFolder.close();
 
     // 3. Atmosphere & Sky
@@ -187,7 +215,7 @@ export class ControlPanel {
       dawn: () => setTimePreset(6.25),
       morning: () => setTimePreset(9.5),
       sunset: () => setTimePreset(18.33),
-      night: () => setTimePreset(23.0),
+      midnight: () => setTimePreset(0.25),
       toggleCampfire: () => this.callbacks.onToggleCampfire?.(),
       startleBirds: () => this.callbacks.onStartleBirds?.(),
       triggerLightning: () => this.callbacks.onTriggerLightning?.(),
@@ -197,7 +225,7 @@ export class ControlPanel {
     actionsFolder.add(actions, 'dawn').name('Dawn (6:15)');
     actionsFolder.add(actions, 'morning').name('Morning (9:30)');
     actionsFolder.add(actions, 'sunset').name('Sunset (18:20)');
-    actionsFolder.add(actions, 'night').name('Moonlit Night (23:00)');
+    actionsFolder.add(actions, 'midnight').name('Aurora Midnight (0:15)');
     actionsFolder.add(actions, 'toggleCampfire').name('Toggle Campfire');
     actionsFolder.add(actions, 'startleBirds').name('Startle Birds');
     actionsFolder.add(actions, 'triggerLightning').name('Trigger Lightning');

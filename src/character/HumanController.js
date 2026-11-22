@@ -1,5 +1,9 @@
 import * as THREE from 'three';
-import { HumanMeshBuilder } from './HumanMeshBuilder.js';
+import {
+  CharacterFactory,
+  CHARACTER_PRESETS,
+  CHARACTER_LABELS,
+} from './CharacterFactory.js';
 import { HumanAnimatorIK } from './HumanAnimatorIK.js';
 import { SpatialHash2D } from '../interaction/ControlsAndRaycast.js';
 import { WATER_LEVEL } from '../world/Terrain.js';
@@ -10,11 +14,14 @@ const MAP_BOUND = 104;
 const PLAYER_RADIUS = 0.42;
 const GRAVITY = -16.2;
 const JUMP_VELOCITY = 5.75;
+const DEEP_SWIM_THRESHOLD = 0.85;
+const SURFACE_FLOAT_OFFSET = 1.34; // root Y at surface = WATER_LEVEL - 1.34 (head cleanly above water)
 
 const _v1 = new THREE.Vector3();
 const _footL = new THREE.Vector3();
 const _footR = new THREE.Vector3();
 const _eyeWorld = new THREE.Vector3();
+const _headWorld = new THREE.Vector3();
 const _camGoal = new THREE.Vector3();
 const _lookGoal = new THREE.Vector3();
 const _forward = new THREE.Vector3();
@@ -24,11 +31,20 @@ const _surfNormal = new THREE.Vector3(0, 1, 0);
 const _lookDelta = { dx: 0, dy: 0 };
 const _moveIntent = { forward: 0, right: 0, magnitude: 0, isAnalog: false };
 
+const SHORT_CHAR_NAMES = {
+  liam: 'LIAM',
+  lyra: 'LYRA',
+  kael: 'KAEL',
+  kenji: 'KENJI',
+};
+
 /**
- * Playable human character controller integrating unified keyboard/mouse/multi-touch
- * InputManager, multi-layer SurfaceSolver (terrain + cabin steps/floors + arched bridge
- * + hollow redwood + stone cavern + wall/doorway sliding + indoor shelter physics),
- * SpatialHash2D trunk/boulder collision, Foot IK, dust bursts, and 3 cameras (V / CAM).
+ * Playable skinned game-character controller supporting:
+ *  - 4 instant-swap SkinnedMesh characters (Liam, Lyra, Kael, Kenji) with strict .dispose() hygiene
+ *  - Unified InputManager (keyboard/mouse + multi-touch thumbstick/look/pinch/buttons)
+ *  - Multi-layer SurfaceSolver (hills, cabin steps/floors, bridge planks, hollow redwood, cavern, wall sliding)
+ *  - Full buoyancy, treading water, breaststroke/front-crawl swimming, underwater diving & rising bubbles
+ *  - 4-stage rat-on-leg fear/shaking reaction, emotes (1-4), Foot IK, dust puffs & 3 camera modes.
  */
 export class HumanController {
   constructor(
@@ -38,7 +54,7 @@ export class HumanController {
     streamWater,
     audio,
     callbacks = {},
-    { inputManager = null, surfaceSolver = null } = {}
+    { inputManager = null, surfaceSolver = null, initialCharacter = 'liam' } = {}
   ) {
     this.engine = engine;
     this.scene = engine.scene;
@@ -52,12 +68,13 @@ export class HumanController {
     this.audio = audio;
     this.callbacks = callbacks;
 
-    // 1. Build upgraded procedural human rig & surface-aware Foot IK animator
-    this.rig = new HumanMeshBuilder();
+    // 1. Build initial skinned character rig & Foot IK / Swim / Emote animator
+    this._characterId = CHARACTER_PRESETS.includes(initialCharacter) ? initialCharacter : 'liam';
+    this.rig = CharacterFactory.createCharacter(this._characterId);
     this.animator = new HumanAnimatorIK(this.rig, surfaceSolver || terrain);
     this.scene.add(this.rig.root);
 
-    // 2. Spatial-hash 2D collision for trees, boulders, logs, stumps, and campfire
+    // 2. Spatial-hash 2D collision for trees, boulders, logs, stumps & campfire
     this.spatialHash = new SpatialHash2D(4.0);
 
     // Spawn cleanly in the mossy campfire glade right beside the fire overlooking cabin & bridge
@@ -81,8 +98,10 @@ export class HumanController {
     this._currentFov = 58;
     this._baseFov = 58;
     this._cameraShake = 0;
+    this._swapPopTimer = 0;
+    this._cameraUnderwater = false;
 
-    // Locomotion, shelter & stamina state
+    // Locomotion, swimming, shelter & stamina state
     this.sprintMultiplier = 1.0;
     this.infiniteStamina = false;
     this.stamina = 100.0;
@@ -101,6 +120,15 @@ export class HumanController {
     };
     this._lastAcousticZone = 'outdoor';
 
+    // Swim / dive state
+    this._swimming = false;
+    this._inDeepWater = false;
+    this._submerged = false;
+    this._swimMode = 'none';
+    this._swimStrokeTimer = 0;
+    this._bubbleTimer = 0;
+    this._swimWakeTimer = 0;
+
     this._grounded = true;
     this._skidTimer = 0;
     this._skidDir = new THREE.Vector2(0, 1);
@@ -110,13 +138,15 @@ export class HumanController {
     this._wadeRippleTimer = 0;
     this._lastPanicStage = 0;
     this._lastBrushTime = -1;
+    this._emoteCycleNext = 1;
 
     // Cached foot world positions for wildlife & foliage parting
     this._footWorldL = new THREE.Vector3();
     this._footWorldR = new THREE.Vector3();
 
-    // Kicked-up dirt/leaf footstep dust pool
+    // Particle pools: dirt/leaf footstep dust + rising underwater air bubbles
     this._dust = this._initDustParticles();
+    this._bubbles = this._initBubbleParticles();
 
     // Sync initial rig transform and camera placement
     this._applyRigTransform();
@@ -141,7 +171,93 @@ export class HumanController {
   }
 
   // ---------------------------------------------------------------------------
-  // Footstep Dust & Skid Debris Pool
+  // Character Switcher (Zero-Leak .dispose() + Golden Swap Pop)
+  // ---------------------------------------------------------------------------
+
+  getCharacterId() {
+    return this._characterId;
+  }
+
+  getCharacterName() {
+    return CHARACTER_LABELS[this._characterId] || 'Forest Ranger (Liam)';
+  }
+
+  getCharacterShortName() {
+    return SHORT_CHAR_NAMES[this._characterId] || 'LIAM';
+  }
+
+  cycleCharacter() {
+    const idx = CHARACTER_PRESETS.indexOf(this._characterId);
+    const next = CHARACTER_PRESETS[(idx + 1) % CHARACTER_PRESETS.length];
+    return this.switchCharacter(next);
+  }
+
+  switchCharacter(presetId) {
+    const nextId = CHARACTER_PRESETS.includes(presetId) ? presetId : 'liam';
+    if (nextId === this._characterId && this.rig) return this._characterId;
+
+    // Capture live state before swapping
+    const oldRig = this.rig;
+    const prevPanic = this.animator?.getPanicInfo?.();
+    const headVisible = this._cameraMode !== 'First-Person Body';
+
+    // Remove and thoroughly dispose old character GPU resources (zero memory leak)
+    if (oldRig) {
+      if (oldRig.root?.parent) {
+        oldRig.root.parent.remove(oldRig.root);
+      }
+      oldRig.dispose();
+    }
+
+    // Create new continuous vertex-weighted SkinnedMesh character
+    this._characterId = nextId;
+    this.rig = CharacterFactory.createCharacter(nextId);
+    this.rig.setHeadVisible(headVisible);
+    this.rig.setSweatLevel(this._sweatLevel);
+    this.rig.setLegWetness(this._legWetness);
+    this.rig.setRainWetness(this._rainWetness);
+    this.rig.setFaceFlush(this._faceFlush);
+    this.scene.add(this.rig.root);
+
+    // Rebind animator cleanly onto the new skeleton (preserving active rat panic if mid-scare!)
+    this.animator = new HumanAnimatorIK(this.rig, this.surfaceSolver || this.terrain);
+    if (prevPanic?.active) {
+      this.animator.triggerRatPanic(prevPanic.side || 'R');
+    }
+
+    this._applyRigTransform();
+    this.rig.root.updateMatrixWorld(true);
+    this.rig.getFootWorldPositions(this._footWorldL, this._footWorldR);
+
+    // Subtle celebratory camera pop + golden burst + chime callback
+    this._swapPopTimer = 0.28;
+    this.audio?.playCharacterSwap?.();
+    this.callbacks.onCharacterSwitched?.(nextId, this.position, this.getCharacterName());
+    return nextId;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Character Emotes (1–4)
+  // ---------------------------------------------------------------------------
+
+  playEmote(emoteId) {
+    if (this._swimming || !this._grounded) return false;
+    const id = clamp(Math.round(Number(emoteId) || 1), 1, 4);
+    this._emoteCycleNext = (id % 4) + 1;
+    this.animator?.playEmote?.(id);
+    return true;
+  }
+
+  cycleEmote() {
+    return this.playEmote(this._emoteCycleNext);
+  }
+
+  getActiveEmote() {
+    return this.animator?.getActiveEmote?.() ?? 0;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Footstep Dust & Rising Underwater Air Bubbles Pools
   // ---------------------------------------------------------------------------
 
   _initDustParticles() {
@@ -272,6 +388,131 @@ export class HumanController {
     }
   }
 
+  _initBubbleParticles() {
+    const count = 96;
+    const positions = new Float32Array(count * 3);
+    const velocities = new Float32Array(count * 3);
+    const ages = new Float32Array(count);
+    const lifetimes = new Float32Array(count);
+    const sizes = new Float32Array(count);
+    const alphas = new Float32Array(count);
+
+    for (let i = 0; i < count; i++) {
+      ages[i] = 99;
+      lifetimes[i] = 1;
+      positions[i * 3 + 1] = -999;
+      sizes[i] = 0;
+      alphas[i] = 0;
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+    geo.setAttribute('aAlpha', new THREE.BufferAttribute(alphas, 1));
+
+    const mat = new THREE.ShaderMaterial({
+      vertexShader: /* glsl */ `
+        attribute float aSize;
+        attribute float aAlpha;
+        varying float vAlpha;
+        void main() {
+          vAlpha = aAlpha;
+          vec4 mvPos = modelViewMatrix * vec4( position, 1.0 );
+          gl_PointSize = aSize * ( 280.0 / max( -mvPos.z, 0.6 ) );
+          gl_Position = projectionMatrix * mvPos;
+        }
+      `,
+      fragmentShader: /* glsl */ `
+        varying float vAlpha;
+        void main() {
+          if ( vAlpha <= 0.005 ) discard;
+          vec2 c = gl_PointCoord - 0.5;
+          float r = length( c );
+          if ( r > 0.5 ) discard;
+          // Glossy hollow air bubble ring with specular catchlight
+          float rim = smoothstep( 0.22, 0.46, r );
+          float spec = smoothstep( 0.16, 0.03, length( c - vec2( -0.15, -0.16 ) ) );
+          vec3 col = mix( vec3( 0.62, 0.94, 1.0 ), vec3( 1.0 ), clamp( rim * 0.55 + spec, 0.0, 1.0 ) );
+          float alpha = ( 0.28 + rim * 0.52 + spec * 0.65 ) * vAlpha;
+          gl_FragColor = vec4( col, alpha );
+        }
+      `,
+      transparent: true,
+      depthWrite: false,
+    });
+
+    const points = new THREE.Points(geo, mat);
+    points.frustumCulled = false;
+    points.renderOrder = 6;
+    this.scene.add(points);
+
+    return {
+      points,
+      geo,
+      mat,
+      count,
+      cursor: 0,
+      positions,
+      velocities,
+      ages,
+      lifetimes,
+      sizes,
+      alphas,
+    };
+  }
+
+  _spawnBubbles(origin, count = 4) {
+    const b = this._bubbles;
+    for (let k = 0; k < count; k++) {
+      const i = b.cursor;
+      b.cursor = (b.cursor + 1) % b.count;
+
+      b.positions[i * 3] = origin.x + (Math.random() - 0.5) * 0.28;
+      b.positions[i * 3 + 1] = origin.y + (Math.random() - 0.5) * 0.16;
+      b.positions[i * 3 + 2] = origin.z + (Math.random() - 0.5) * 0.28;
+
+      b.velocities[i * 3] = (Math.random() - 0.5) * 0.45;
+      b.velocities[i * 3 + 1] = 0.85 + Math.random() * 0.75;
+      b.velocities[i * 3 + 2] = (Math.random() - 0.5) * 0.45;
+
+      b.ages[i] = 0;
+      b.lifetimes[i] = 1.1 + Math.random() * 1.1;
+      b.sizes[i] = 0.07 + Math.random() * 0.095;
+      b.alphas[i] = 0.85;
+    }
+  }
+
+  _updateBubbles(dt, elapsed) {
+    const b = this._bubbles;
+    let activeAny = false;
+    for (let i = 0; i < b.count; i++) {
+      if (b.ages[i] >= b.lifetimes[i]) continue;
+      activeAny = true;
+      b.ages[i] += dt;
+      const t = b.ages[i] / b.lifetimes[i];
+
+      // Sinusoidal rising bubble wobble until popping cleanly at WATER_LEVEL
+      b.positions[i * 3] += (b.velocities[i * 3] + Math.sin(elapsed * 5.2 + i * 1.7) * 0.24) * dt;
+      b.positions[i * 3 + 1] += b.velocities[i * 3 + 1] * dt;
+      b.positions[i * 3 + 2] += (b.velocities[i * 3 + 2] + Math.cos(elapsed * 4.6 + i * 2.1) * 0.24) * dt;
+
+      if (t >= 1 || b.positions[i * 3 + 1] >= WATER_LEVEL - 0.02) {
+        b.ages[i] = b.lifetimes[i];
+        b.alphas[i] = 0;
+        b.positions[i * 3 + 1] = -999;
+        continue;
+      }
+
+      b.alphas[i] = Math.sin(Math.min(t * 4.0, 1.0) * Math.PI * 0.5) * (1.0 - t * 0.35);
+    }
+
+    if (activeAny) {
+      b.geo.attributes.position.needsUpdate = true;
+      b.geo.attributes.aSize.needsUpdate = true;
+      b.geo.attributes.aAlpha.needsUpdate = true;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Public API & External Triggers
   // ---------------------------------------------------------------------------
@@ -346,9 +587,26 @@ export class HumanController {
     if (!pos) return;
     const refY = Number.isFinite(pos.y) ? pos.y + 0.5 : Infinity;
     const surf = this._sampleGround(pos.x, pos.z, refY);
-    this.position.set(pos.x, surf.height, pos.z);
+    const waterDepth = surf.isStructure ? 0 : Math.max(0, WATER_LEVEL - surf.height);
+
+    if (waterDepth >= DEEP_SWIM_THRESHOLD) {
+      // Float cleanly at surface in deep lagoon unless a specific underwater Y was requested
+      const startY = Number.isFinite(pos.y) && pos.y < WATER_LEVEL - SURFACE_FLOAT_OFFSET
+        ? Math.max(pos.y, surf.height + 0.14)
+        : WATER_LEVEL - SURFACE_FLOAT_OFFSET;
+      this.position.set(pos.x, startY, pos.z);
+      this._swimming = true;
+      this._inDeepWater = true;
+      this._grounded = false;
+    } else {
+      this.position.set(pos.x, surf.height, pos.z);
+      this._swimming = false;
+      this._inDeepWater = false;
+      this._submerged = false;
+      this._grounded = true;
+    }
+
     this.velocity.set(0, 0, 0);
-    this._grounded = true;
     this._skidTimer = 0;
     this._slipTimer = 0;
     if (Number.isFinite(yaw)) {
@@ -376,6 +634,17 @@ export class HumanController {
   }
 
   triggerJump() {
+    if (this._swimming) {
+      // In deep water, Space / UP swims cleanly upward & cancels crouch/dive latch!
+      this.inputManager?.setCrouchToggled?.(false);
+      this.velocity.y = Math.max(this.velocity.y, 2.55);
+      if (this.position.y >= WATER_LEVEL - SURFACE_FLOAT_OFFSET - 0.15) {
+        this.streamWater?.spawnImpact?.(this.position, 0.85);
+        this.audio?.playSwimStroke?.(false);
+      }
+      return;
+    }
+
     if (!this._grounded || this._slipTimer > 0) return;
     const panic = this.animator.getPanicInfo();
     if (panic.active && panic.stage === 1) return;
@@ -404,7 +673,7 @@ export class HumanController {
     this.inputManager?.setCrouchToggled?.(false);
     this._cameraShake = 0.35;
 
-    if (this._grounded) {
+    if (this._grounded && !this._swimming) {
       const sinY = Math.sin(this.facingYaw);
       const cosY = Math.cos(this.facingYaw);
       this.velocity.x -= sinY * 1.9;
@@ -466,6 +735,22 @@ export class HumanController {
     return this._currentSurfaceType;
   }
 
+  isSwimming() {
+    return this._swimming;
+  }
+
+  isInDeepWater() {
+    return this._inDeepWater;
+  }
+
+  isSubmerged() {
+    return this._submerged;
+  }
+
+  isCameraUnderwater() {
+    return this._cameraUnderwater;
+  }
+
   getRig() {
     return this.rig;
   }
@@ -497,7 +782,7 @@ export class HumanController {
   }
 
   // ---------------------------------------------------------------------------
-  // Per-Frame Physics, Surface Solver, Shelter, Foot IK, Audio & Camera Update
+  // Per-Frame Physics, Swimming/Diving, Surface Solver, Foot IK & Camera Update
   // ---------------------------------------------------------------------------
 
   update(dt, elapsed) {
@@ -506,6 +791,7 @@ export class HumanController {
     if (this._slipCooldown > 0) this._slipCooldown = Math.max(0, this._slipCooldown - safeDt);
     if (this._slipTimer > 0) this._slipTimer = Math.max(0, this._slipTimer - safeDt);
     if (this._cameraShake > 0) this._cameraShake = Math.max(0, this._cameraShake - safeDt * 1.4);
+    if (this._swapPopTimer > 0) this._swapPopTimer = Math.max(0, this._swapPopTimer - safeDt);
 
     // 0. Consume camera look & pinch/wheel zoom deltas from InputManager
     if (this.inputManager && this._cameraMode !== 'Free Orbit') {
@@ -517,7 +803,7 @@ export class HumanController {
           this._fpPitch = clamp(this._fpPitch - _lookDelta.dy * sens, -1.28, 1.18);
           this.facingYaw = this._camYaw;
         } else {
-          this._camPitch = clamp(this._camPitch + _lookDelta.dy * sens, -0.22, 1.08);
+          this._camPitch = clamp(this._camPitch + _lookDelta.dy * sens, -0.35, 1.12);
         }
       }
 
@@ -526,16 +812,38 @@ export class HumanController {
         this._thirdPersonDist = clamp(this._thirdPersonDist + zoomDelta * 0.006, 2.6, 8.2);
       }
     } else if (this.inputManager) {
-      // Drain unused deltas in Free Orbit
       this.inputManager.consumeLookDelta(_lookDelta);
       this.inputManager.consumeZoomDelta();
     }
 
     const panic = this.animator.getPanicInfo();
     const surfHere = this._sampleGround(this.position.x, this.position.z, this.position.y);
-    const waterDepth = surfHere.isStructure ? 0 : Math.max(0, WATER_LEVEL - surfHere.height);
-    const wading = waterDepth > 0.05;
-    const crouching = Boolean(this.inputManager?.isCrouching?.()) && !wading && !panic.active && this._slipTimer <= 0;
+    const waterDepthHere = surfHere.isStructure ? 0 : Math.max(0, WATER_LEVEL - surfHere.height);
+
+    // Hysteresis between shallow wade and deep swimming prevents chatter right at depth = 0.85
+    const enterSwim = !this._swimming && waterDepthHere >= DEEP_SWIM_THRESHOLD && this.position.y <= WATER_LEVEL - 0.65;
+    const staySwim = this._swimming && waterDepthHere >= DEEP_SWIM_THRESHOLD - 0.14;
+    const wasSwimming = this._swimming;
+    this._swimming = enterSwim || staySwim;
+    this._inDeepWater = waterDepthHere >= DEEP_SWIM_THRESHOLD - 0.1;
+
+    if (this._swimming && !wasSwimming) {
+      // Smooth plunge splash when entering deep lagoon
+      this._grounded = false;
+      this._skidTimer = 0;
+      this._slipTimer = 0;
+      this.streamWater?.spawnImpact?.(this.position, 1.35);
+      this.audio?.playSwimStroke?.(true);
+    } else if (!this._swimming && wasSwimming) {
+      this._submerged = false;
+      this._swimMode = 'none';
+      this.inputManager?.setCrouchToggled?.(false);
+    }
+
+    const wading = !this._swimming && waterDepthHere > 0.05;
+    const diveInput = Boolean(this.inputManager?.isCrouching?.());
+    const ascendInput = Boolean(this.inputManager?.isJumpHeld?.());
+    const crouching = !this._swimming && diveInput && !wading && !panic.active && this._slipTimer <= 0;
 
     // 1. Unified keyboard + analog thumbstick camera-relative movement intent
     if (this._cameraMode === 'Free Orbit') {
@@ -546,7 +854,6 @@ export class HumanController {
     } else {
       _forward.set(Math.sin(this._camYaw), 0, Math.cos(this._camYaw)).normalize();
     }
-    // Right-handed camera-right vector: cross(forward, up) aligns +right to screen-right!
     _right.crossVectors(_forward, _up).normalize();
 
     if (this.inputManager) {
@@ -572,16 +879,16 @@ export class HumanController {
     const crouchSpeed = 1.68;
 
     const wantsSprint = Boolean(this.inputManager?.isSprinting?.()) && hasInput && !crouching && !this.exhausted;
-    const panickedSprint = Boolean(panic.active && (panic.stage === 2 || panic.stage === 3) && wantsSprint);
-    const panicRooted = Boolean(panic.active && (panic.stage === 1 || (panic.stage === 2 && !panickedSprint)));
+    const panickedSprint = Boolean(!this._swimming && panic.active && (panic.stage === 2 || panic.stage === 3) && wantsSprint);
+    const panicRooted = Boolean(!this._swimming && panic.active && (panic.stage === 1 || (panic.stage === 2 && !panickedSprint)));
 
-    // 2. Momentum Skid-Stop detection
+    // 2. Momentum Skid-Stop detection (dry land only)
     if (this._skidTimer > 0) {
       this._skidTimer = Math.max(0, this._skidTimer - safeDt);
       if (this._grounded && !surfHere.isStructure && Math.random() < safeDt * 22) {
         this._spawnDustBurst(this.position, 2, 0.85, 0.9);
       }
-    } else if (this._grounded && !wading && !panic.active && this._slipTimer <= 0) {
+    } else if (this._grounded && !this._swimming && !wading && !panic.active && this._slipTimer <= 0) {
       if (horizSpeed > 5.0 * this.sprintMultiplier) {
         this._peakRecentSpeed = Math.max(this._peakRecentSpeed, horizSpeed);
       } else {
@@ -605,9 +912,14 @@ export class HumanController {
       }
     }
 
-    // 3. Target horizontal speed & acceleration (honoring analog thumbstick quadratic tilt!)
+    // 3. Target horizontal speed & acceleration
     let targetSpeed = 0;
-    if (this._slipTimer > 0) {
+    if (this._swimming) {
+      if (hasInput) {
+        const swimBase = wantsSprint ? 5.15 * this.sprintMultiplier : 3.05;
+        targetSpeed = _moveIntent.isAnalog ? lerp(1.1, swimBase, inputMag) : swimBase;
+      }
+    } else if (this._slipTimer > 0) {
       targetSpeed = horizSpeed * 0.55;
     } else if (panicRooted || this._skidTimer > 0) {
       targetSpeed = 0;
@@ -620,11 +932,10 @@ export class HumanController {
         targetSpeed = maxSprintSpeed;
       } else {
         const baseWalk = this.exhausted ? 2.15 : walkSpeed;
-        // Smooth slow walk at slight analog tilt -> brisk walk at mid-tilt
         targetSpeed = _moveIntent.isAnalog ? lerp(0.95, baseWalk * 1.22, inputMag) : baseWalk;
       }
       if (wading) {
-        const waterDrag = lerp(0.82, 0.52, clamp(waterDepth / 0.85, 0, 1));
+        const waterDrag = lerp(0.82, 0.52, clamp(waterDepthHere / 0.85, 0, 1));
         targetSpeed *= waterDrag;
       }
     }
@@ -632,9 +943,9 @@ export class HumanController {
     const desiredVx = hasInput && !panicRooted && this._skidTimer <= 0 ? _v1.x * targetSpeed : 0;
     const desiredVz = hasInput && !panicRooted && this._skidTimer <= 0 ? _v1.z * targetSpeed : 0;
 
-    let accelRate = hasInput ? (wantsSprint ? 6.4 : 9.8) : 9.2;
+    let accelRate = this._swimming ? 4.2 : hasInput ? (wantsSprint ? 6.4 : 9.8) : 9.2;
     if (this._skidTimer > 0) accelRate = 4.6;
-    if (!this._grounded) accelRate = 2.6;
+    if (!this._grounded && !this._swimming) accelRate = 2.6;
     if (this._slipTimer > 0) accelRate = 3.2;
 
     const blend = 1.0 - Math.exp(-safeDt * accelRate);
@@ -643,10 +954,12 @@ export class HumanController {
 
     // 4. Stamina drain / exhaustion / sweat / flush
     const newHorizSpeed = Math.hypot(this.velocity.x, this.velocity.z);
-    const actuallySprinting = wantsSprint && newHorizSpeed > 4.2 && this._grounded && !this.exhausted;
+    const actuallySprinting = this._swimming
+      ? wantsSprint && newHorizSpeed > 3.2 && !this.exhausted
+      : wantsSprint && newHorizSpeed > 4.2 && this._grounded && !this.exhausted;
 
     if (actuallySprinting && !this.infiniteStamina) {
-      this.stamina = Math.max(0, this.stamina - 18.5 * safeDt);
+      this.stamina = Math.max(0, this.stamina - (this._swimming ? 14.5 : 18.5) * safeDt);
       if (this.stamina <= 0.1) {
         this.stamina = 0;
         this.exhausted = true;
@@ -659,18 +972,18 @@ export class HumanController {
       }
     }
 
-    const targetSweat = actuallySprinting ? 1.0 : this.exhausted ? 0.92 : panic.active ? 0.85 : 0.0;
+    const targetSweat = !this._swimming && actuallySprinting ? 1.0 : this.exhausted ? 0.85 : panic.active ? 0.85 : 0.0;
     this._sweatLevel = lerp(
       this._sweatLevel,
       targetSweat,
-      1.0 - Math.exp(-safeDt * (targetSweat > this._sweatLevel ? 0.35 : 0.14))
+      1.0 - Math.exp(-safeDt * (targetSweat > this._sweatLevel ? 0.35 : 0.25))
     );
     const targetFlush = panic.active ? 0.78 : this.exhausted ? 0.72 : actuallySprinting ? 0.45 : 0.0;
     this._faceFlush = lerp(this._faceFlush, targetFlush, 1.0 - Math.exp(-safeDt * 0.9));
     this.rig.setSweatLevel(this._sweatLevel);
     this.rig.setFaceFlush(this._faceFlush);
 
-    // 5. Integrate horizontal position & resolve BOTH tree/boulder AND structure wall/doorway collisions!
+    // 5. Integrate horizontal position & resolve tree/boulder + structure wall/doorway collisions
     this.position.x += this.velocity.x * safeDt;
     this.position.z += this.velocity.z * safeDt;
     this.position.x = clamp(this.position.x, -MAP_BOUND, MAP_BOUND);
@@ -681,48 +994,122 @@ export class HumanController {
       this.surfaceSolver.resolveCollision(this.position, PLAYER_RADIUS, crouching ? 1.25 : 1.76);
     }
 
-    // 6. Vertical gravity & multi-layer walkable surface snapping (steps, cabin floors, bridge deck, cavern floor)
+    // 6. Vertical motion: Buoyancy & Underwater Diving vs Ground Gravity & Step-Up
     const nextSurf = this._sampleGround(this.position.x, this.position.z, this.position.y);
     const groundY = nextSurf.height;
-    this._currentSurfaceType = nextSurf.surfaceType;
+    this._currentSurfaceType = this._swimming ? 'water' : nextSurf.surfaceType;
 
-    const wasGrounded = this._grounded;
-    if (!this._grounded) {
-      this.velocity.y += GRAVITY * safeDt;
+    if (this._swimming) {
+      this._grounded = false;
+      const surfaceTargetY = WATER_LEVEL - SURFACE_FLOAT_OFFSET;
+      const minBedY = groundY + 0.14;
+
+      let targetVy = 0;
+      if (diveInput) {
+        // Diving smoothly downward (C / Ctrl / DIVE)
+        targetVy = -2.35;
+      } else if (ascendInput) {
+        // Swimming smoothly upward (Space / UP)
+        targetVy = 2.65;
+      } else if (this.position.y < surfaceTargetY - 0.18) {
+        // Gentle neutral-positive buoyancy slowly drifting upward if neither diving nor ascending
+        targetVy = 0.28;
+      } else {
+        // Soft buoyant spring holding head cleanly above water surface
+        const bob = Math.sin(elapsed * 2.4) * 0.055;
+        targetVy = (surfaceTargetY + bob - this.position.y) * 5.2;
+      }
+
+      this.velocity.y = lerp(this.velocity.y, targetVy, 1.0 - Math.exp(-safeDt * 6.0));
       this.position.y += this.velocity.y * safeDt;
-      if (this.position.y <= groundY) {
-        this.position.y = groundY;
-        const impactVel = Math.abs(this.velocity.y);
-        this.velocity.y = 0;
-        this._grounded = true;
-        if (!wasGrounded && impactVel > 2.2) {
-          const wDepth = nextSurf.isStructure ? 0 : Math.max(0, WATER_LEVEL - groundY);
-          if (wDepth > 0.05) {
-            this.streamWater?.spawnImpact?.(this.position, clamp(impactVel / 6, 0.7, 1.6));
-            this.audio?.playFootstep?.({ surface: 'water', intensity: 1.0 });
-          } else {
-            if (!nextSurf.isStructure) {
-              this._spawnDustBurst(this.position, 9, 1.15, 1.25);
-            }
-            this.audio?.playFootstep?.({ surface: nextSurf.surfaceType || 'dirt', intensity: 0.95 });
+
+      // Clamp between lagoon bed and water surface float height
+      if (this.position.y < minBedY) {
+        this.position.y = minBedY;
+        if (this.velocity.y < 0) this.velocity.y = 0;
+      }
+      if (this.position.y > surfaceTargetY + 0.12) {
+        this.position.y = surfaceTargetY + 0.12;
+        if (this.velocity.y > 0) this.velocity.y = 0;
+      }
+
+      // Check submerged status & swim animation mode
+      this._submerged = this.position.y < WATER_LEVEL - 1.56;
+      if (this._submerged || diveInput) {
+        this._swimMode = 'dive';
+      } else if (actuallySprinting) {
+        this._swimMode = 'sprint';
+      } else if (newHorizSpeed > 0.35) {
+        this._swimMode = 'stroke';
+      } else {
+        this._swimMode = 'tread';
+      }
+
+      // Swim audio strokes, frothy surface wake ripples & underwater rising air bubbles!
+      if (!this._submerged) {
+        this._swimWakeTimer -= safeDt;
+        if (this._swimWakeTimer <= 0) {
+          this._swimWakeTimer = actuallySprinting ? 0.15 : newHorizSpeed > 0.4 ? 0.28 : 0.65;
+          this.streamWater?.spawnImpact?.(
+            this.position,
+            actuallySprinting ? 1.15 : newHorizSpeed > 0.4 ? 0.72 : 0.38
+          );
+        }
+        if (newHorizSpeed > 0.4) {
+          this._swimStrokeTimer -= safeDt;
+          if (this._swimStrokeTimer <= 0) {
+            this._swimStrokeTimer = actuallySprinting ? 0.36 : 0.64;
+            this.audio?.playSwimStroke?.(actuallySprinting);
           }
+        }
+      } else {
+        this._bubbleTimer -= safeDt;
+        if (this._bubbleTimer <= 0) {
+          this._bubbleTimer = 0.24 + Math.random() * 0.26;
+          this.rig.bones.head.getWorldPosition(_headWorld);
+          this._spawnBubbles(_headWorld, 3 + Math.floor(Math.random() * 3));
+          this.audio?.playBubbleBurst?.(3);
         }
       }
     } else {
-      // Smooth step-up interpolation so climbing 3 porch steps looks fluid & organic
-      const stepDiff = groundY - this.position.y;
-      if (stepDiff > 0.01 && stepDiff <= 0.42) {
-        this.position.y = lerp(this.position.y, groundY, 1.0 - Math.exp(-safeDt * 22.0));
-      } else if (stepDiff < -0.55) {
-        // Stepping off a high ledge launches cleanly into gravity
-        this._grounded = false;
+      this._submerged = false;
+      this._swimMode = 'none';
+      const wasGrounded = this._grounded;
+      if (!this._grounded) {
+        this.velocity.y += GRAVITY * safeDt;
+        this.position.y += this.velocity.y * safeDt;
+        if (this.position.y <= groundY) {
+          this.position.y = groundY;
+          const impactVel = Math.abs(this.velocity.y);
+          this.velocity.y = 0;
+          this._grounded = true;
+          if (!wasGrounded && impactVel > 2.2) {
+            const wDepth = nextSurf.isStructure ? 0 : Math.max(0, WATER_LEVEL - groundY);
+            if (wDepth > 0.05) {
+              this.streamWater?.spawnImpact?.(this.position, clamp(impactVel / 6, 0.7, 1.6));
+              this.audio?.playFootstep?.({ surface: 'water', intensity: 1.0 });
+            } else {
+              if (!nextSurf.isStructure) {
+                this._spawnDustBurst(this.position, 9, 1.15, 1.25);
+              }
+              this.audio?.playFootstep?.({ surface: nextSurf.surfaceType || 'dirt', intensity: 0.95 });
+            }
+          }
+        }
       } else {
-        this.position.y = groundY;
+        const stepDiff = groundY - this.position.y;
+        if (stepDiff > 0.01 && stepDiff <= 0.42) {
+          this.position.y = lerp(this.position.y, groundY, 1.0 - Math.exp(-safeDt * 22.0));
+        } else if (stepDiff < -0.55) {
+          this._grounded = false;
+        } else {
+          this.position.y = groundY;
+        }
+        this.velocity.y = 0;
       }
-      this.velocity.y = 0;
     }
 
-    // 7. Indoor Shelter Physics (blocks rain wetness, dampens outdoor wind gusts, sets cave/wood acoustics!)
+    // 7. Indoor Shelter Physics & Acoustic Zones
     if (this.surfaceSolver && typeof this.surfaceSolver.getShelterState === 'function') {
       this._shelterState = this.surfaceSolver.getShelterState(this.position);
     }
@@ -741,17 +1128,17 @@ export class HumanController {
     } else if (hasInput && !panicRooted && this._skidTimer <= 0 && this._slipTimer <= 0) {
       const targetYaw = Math.atan2(_v1.x, _v1.z);
       const diff = this._wrapAngle(targetYaw - this.facingYaw);
-      const step = diff * (1.0 - Math.exp(-safeDt * 11.5));
+      const step = diff * (1.0 - Math.exp(-safeDt * (this._swimming ? 7.5 : 11.5)));
       this.facingYaw = this._wrapAngle(this.facingYaw + step);
       turnRate = clamp(step / safeDt, -5, 5);
     }
 
-    // 9. Stream wetness (dry when on bridge or indoors!), wading ripples & rock slip chance
+    // 9. Stream wetness, wading ripples & rock slip chance
     const currentWaterDepth = nextSurf.isStructure ? 0 : Math.max(0, WATER_LEVEL - groundY);
-    const inStream = currentWaterDepth > 0.04;
-    if (inStream) {
+    const inStream = !this._swimming && currentWaterDepth > 0.04;
+    if (this._swimming || inStream) {
       this._legWetness = lerp(this._legWetness, 1.0, 1.0 - Math.exp(-safeDt * 4.5));
-      if (newHorizSpeed > 0.65 && this._grounded) {
+      if (inStream && newHorizSpeed > 0.65 && this._grounded) {
         this._wadeRippleTimer -= safeDt;
         if (this._wadeRippleTimer <= 0) {
           this._wadeRippleTimer = lerp(0.45, 0.18, clamp(newHorizSpeed / 5.5, 0, 1));
@@ -759,6 +1146,7 @@ export class HumanController {
         }
       }
       if (
+        inStream &&
         this._grounded &&
         this._slipCooldown <= 0 &&
         this._slipTimer <= 0 &&
@@ -776,17 +1164,20 @@ export class HumanController {
       this._legWetness = Math.max(0, this._legWetness - safeDt * dryRate);
     }
 
-    // Rain shelter occlusion: standing under cabin roof, hollow redwood, or cave keeps character dry!
-    const effectiveRainWet = this._shelterState.blocksRain ? 0.0 : this._rainWetness;
-    const smoothRain = lerp(
+    // Full-body wet sheen when swimming or standing in unsheltered Rain!
+    const targetFullWet = this._swimming ? 1.0 : this._shelterState.blocksRain ? 0.0 : this._rainWetness;
+    const smoothFullWet = lerp(
       this.rig.shaderUniforms.uRainWetness.value,
-      effectiveRainWet,
-      1.0 - Math.exp(-safeDt * (effectiveRainWet > 0 ? 1.8 : 0.8))
+      targetFullWet,
+      1.0 - Math.exp(-safeDt * (targetFullWet > 0 ? 2.4 : 0.7))
     );
-    this.rig.setRainWetness(smoothRain);
-    this.rig.setLegWetness(Math.max(this._legWetness, smoothRain * 0.65));
+    this.rig.setRainWetness(smoothFullWet);
+    this.rig.setLegWetness(Math.max(this._legWetness, smoothFullWet * 0.75));
 
-    // 10. Apply root transform BEFORE running Foot IK
+    // Update StreamWater swimmer wake trail
+    this.streamWater?.setSwimmerState?.(this.position, newHorizSpeed, this._swimming && !this._submerged);
+
+    // 10. Apply root transform BEFORE running Foot IK / Swim Pose
     this._applyRigTransform();
     this.rig.root.updateMatrixWorld(true);
 
@@ -795,13 +1186,12 @@ export class HumanController {
     const forwardSpeed = this.velocity.x * sinF + this.velocity.z * cosF;
     const lateralSpeed = this.velocity.x * cosF - this.velocity.z * sinF;
 
-    // Damp outdoor wind intensity on hair & eyelids when sheltered indoors!
     const localWind = this.windSystem
       ? this.windSystem.sampleGustAt(this.position.x, this.position.z).intensity
       : 0.4;
     const shelteredWind = localWind * (1.0 - (this._shelterState.windDamping || 0));
 
-    // 11. Update procedural locomotion, SurfaceSolver-aware 2-bone Foot IK, emotions & secondary springs
+    // 11. Update procedural locomotion, swimming, emotes, 2-bone Foot IK & cloth physics
     this.animator.update(
       safeDt,
       elapsed,
@@ -815,6 +1205,10 @@ export class HumanController {
         crouching,
         wading: inStream,
         waterDepth: currentWaterDepth,
+        swimming: this._swimming,
+        swimMode: this._swimMode,
+        submerged: this._submerged,
+        verticalSwimVel: this.velocity.y,
         skidding: this._skidTimer > 0,
         exhausted: this.exhausted,
         staminaRatio: this.stamina / 100,
@@ -832,13 +1226,12 @@ export class HumanController {
     this._footWorldL.copy(_footL);
     this._footWorldR.copy(_footR);
 
-    // Feed BOTH boots into GPU foliage parting shader
-    this.windSystem?.setHumanFeet?.(this._footWorldL, this._footWorldR, true);
+    this.windSystem?.setHumanFeet?.(this._footWorldL, this._footWorldR, !this._swimming);
     if (this._cameraMode !== 'Free Orbit') {
-      this.windSystem?.setInteractorTarget?.(this.position, true);
+      this.windSystem?.setInteractorTarget?.(this.position, !this._swimming);
     }
 
-    // 12. Human breathing/panting, heartbeat & frantic Stage-2 fabric brush audio
+    // 12. Human breathing/panting, heartbeat & Stage-2 fabric brush audio
     const updatedPanic = this.animator.getPanicInfo();
     if (updatedPanic.brushingPulse && elapsed - this._lastBrushTime > 0.14) {
       this._lastBrushTime = elapsed;
@@ -851,18 +1244,21 @@ export class HumanController {
 
     const exertion = clamp(newHorizSpeed / Math.max(maxSprintSpeed, 1), 0, 1);
     this.audio?.updateHumanAudio?.(safeDt, elapsed, {
-      exertion: actuallySprinting ? exertion : exertion * 0.35,
-      exhausted: this.exhausted,
+      exertion: this._submerged ? 0 : actuallySprinting ? exertion : exertion * 0.35,
+      exhausted: this.exhausted && !this._submerged,
       panicStage: updatedPanic.stage,
       panicActive: updatedPanic.active,
     });
 
-    // 13. Update dust bursts & camera
+    // 13. Update dust, bubbles & active camera + underwater camera detection
     this._updateDust(safeDt);
+    this._updateBubbles(safeDt, elapsed);
     this._updateCamera(safeDt, elapsed, newHorizSpeed, maxSprintSpeed, actuallySprinting, crouching, updatedPanic);
+    this._cameraUnderwater = this.camera.position.y < WATER_LEVEL - 0.03;
   }
 
   _handleFootstep({ side, worldPos, intensity = 0.75 }) {
+    if (this._swimming) return;
     const pos = worldPos || (side === 'L' ? this._footWorldL : this._footWorldR);
     const surf = this._sampleGround(pos.x, pos.z, this.position.y);
 
@@ -906,7 +1302,7 @@ export class HumanController {
       lookY + dist * sinP + 0.3,
       this.position.z - cosY * dist * cosP + rightZ * 0.36
     );
-    const minY = this.terrain.getHeightAt(_camGoal.x, _camGoal.z) + 0.65;
+    const minY = this.terrain.getHeightAt(_camGoal.x, _camGoal.z) + 0.55;
     _camGoal.y = Math.max(_camGoal.y, minY);
 
     this._camPosSmooth.copy(_camGoal);
@@ -917,14 +1313,16 @@ export class HumanController {
 
   _updateCamera(dt, elapsed, horizSpeed, maxSprintSpeed, isSprinting, crouching, panic) {
     const sprintRatio = isSprinting
-      ? clamp((horizSpeed - 3.5) / Math.max(maxSprintSpeed - 3.5, 1), 0, 1)
+      ? clamp((horizSpeed - 3.2) / Math.max(maxSprintSpeed - 3.2, 1), 0, 1)
       : 0;
+    // Subtle character-swap FOV pop!
+    const swapPop = this._swapPopTimer > 0 ? Math.sin((this._swapPopTimer / 0.28) * Math.PI) * 5.2 : 0;
     const targetFov =
       this._cameraMode === 'Free Orbit'
         ? this._baseFov
-        : this._baseFov + sprintRatio * 8.5 + (panic.active && panic.stage <= 2 ? 3.5 : 0);
+        : this._baseFov + sprintRatio * 8.5 + swapPop + (panic.active && panic.stage <= 2 ? 3.5 : 0);
 
-    this._currentFov = lerp(this._currentFov, targetFov, 1.0 - Math.exp(-dt * 5.5));
+    this._currentFov = lerp(this._currentFov, targetFov, 1.0 - Math.exp(-dt * 6.5));
     if (Math.abs(this.camera.fov - this._currentFov) > 0.02) {
       this.camera.fov = this._currentFov;
       this.camera.updateProjectionMatrix();
@@ -933,34 +1331,36 @@ export class HumanController {
     if (this._cameraMode === 'Free Orbit') return;
 
     if (this._cameraMode === 'Third-Person') {
-      // Pull camera slightly tighter indoors so cabin walls/redwood trunk never obscure the explorer!
       const indoorPull = this._shelterState.sheltered ? 0.62 : 1.0;
-      const dist = (this._thirdPersonDist * indoorPull) + sprintRatio * 1.05 - (crouching ? 0.42 : 0);
+      const dist = this._thirdPersonDist * indoorPull + sprintRatio * 1.05 - (crouching ? 0.42 : 0);
       const sinY = Math.sin(this._camYaw);
       const cosY = Math.cos(this._camYaw);
       const cosP = Math.cos(this._camPitch);
       const sinP = Math.sin(this._camPitch);
 
-      const lookY = this.position.y + (crouching ? 1.05 : 1.38);
+      const lookY = this.position.y + (this._submerged ? 1.05 : crouching ? 1.05 : 1.38);
       _lookGoal.set(
         this.position.x + sinY * (1.0 + sprintRatio * 0.85),
         lookY,
         this.position.z + cosY * (1.0 + sprintRatio * 0.85)
       );
 
-      // Right-shoulder offset (+right in right-handed frame is (-cosY, 0, sinY))
       const rightX = -cosY;
       const rightZ = sinY;
+      // When diving underwater, allow camera pitch to drop smoothly below WATER_LEVEL so you enter Underwater View!
+      const verticalBias = this._submerged ? -0.35 : this._shelterState.sheltered ? 0.12 : 0.3;
       _camGoal.set(
         this.position.x - sinY * dist * cosP + rightX * 0.34,
-        lookY + dist * sinP + (this._shelterState.sheltered ? 0.12 : 0.3),
+        lookY + dist * sinP + verticalBias,
         this.position.z - cosY * dist * cosP + rightZ * 0.34
       );
+      if (this._submerged) {
+        _camGoal.y = Math.min(_camGoal.y, WATER_LEVEL - 0.35);
+      }
 
       const camGround = this.terrain.getHeightAt(_camGoal.x, _camGoal.z);
-      _camGoal.y = Math.max(_camGoal.y, camGround + 0.6);
+      _camGoal.y = Math.max(_camGoal.y, camGround + 0.45);
 
-      // Keep camera safely below indoor cabin ceiling/cavern roof when sheltered
       if (this._shelterState.sheltered) {
         _camGoal.y = Math.min(_camGoal.y, this.position.y + 2.45);
       }
@@ -990,7 +1390,7 @@ export class HumanController {
       const shakeMag = this._cameraShake * 0.09 + (panic.active && panic.stage === 2 ? 0.022 : 0);
       this.camera.position.set(
         _eyeWorld.x + (shakeMag > 0.001 ? Math.sin(elapsed * 51.0) * shakeMag : 0),
-        Math.max(_eyeWorld.y, this.terrain.getHeightAt(_eyeWorld.x, _eyeWorld.z) + 0.35),
+        Math.max(_eyeWorld.y, this.terrain.getHeightAt(_eyeWorld.x, _eyeWorld.z) + 0.32),
         _eyeWorld.z
       );
       _lookGoal.set(
@@ -1010,11 +1410,17 @@ export class HumanController {
   }
 
   dispose() {
-    this.scene.remove(this.rig.root);
-    this.rig.dispose();
+    if (this.rig) {
+      if (this.rig.root?.parent) this.rig.root.parent.remove(this.rig.root);
+      this.rig.dispose();
+    }
 
     this.scene.remove(this._dust.points);
     this._dust.geo.dispose();
     this._dust.mat.dispose();
+
+    this.scene.remove(this._bubbles.points);
+    this._bubbles.geo.dispose();
+    this._bubbles.mat.dispose();
   }
 }

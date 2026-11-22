@@ -5,20 +5,22 @@ import { createRng, clamp, lerp, smoothstep, smootherstep } from '../utils/rando
 export const TERRAIN_SIZE = 240;
 export const TERRAIN_SEGMENTS = 256;
 export const WATER_LEVEL = 0.0;
+export const LAGOON_Z = 29.0;
 export const CLEARING_CENTER = new THREE.Vector2(10.5, 6.0);
 export const CLEARING_RADIUS = 11.5;
 
 /**
  * Procedural 240x240 terrain with 5-octave Simplex hills, a smooth sinusoidal
- * meandering stream valley below y = 0, a flat mossy central campfire clearing,
- * and a custom PBR 4-biome splat-blended shader with procedural diffuse, roughness,
- * normal maps, wetness sheen, and shallow riverbed caustics.
+ * meandering stream valley below y = 0 widening into a deep swimming lagoon at z = 29.0,
+ * a flat mossy central campfire clearing, and a custom PBR 4-biome splat-blended shader
+ * with procedural diffuse, roughness, normal maps, wetness sheen, and riverbed caustics.
  */
 export class Terrain {
   constructor(seed = 4242) {
     this.size = TERRAIN_SIZE;
     this.segments = TERRAIN_SEGMENTS;
     this.waterLevel = WATER_LEVEL;
+    this.lagoonZ = LAGOON_Z;
     this.clearingCenter = CLEARING_CENTER.clone();
     this.clearingRadius = CLEARING_RADIUS;
 
@@ -71,10 +73,14 @@ export class Terrain {
   }
 
   /**
-   * Stream half-width varies gently along its length for organic pools and narrows.
+   * Stream half-width varies gently along its length for organic pools and narrows,
+   * widening smoothly into a ~22m natural swimming lagoon centered at LAGOON_Z (29.0)
+   * with virtually zero impact on the upstream footbridge at z = 6.5.
    */
   getStreamHalfWidth(z) {
-    return 4.3 + Math.sin(z * 0.055 + 0.5) * 0.95 + Math.cos(z * 0.12) * 0.35;
+    const baseHalf = 4.3 + Math.sin(z * 0.055 + 0.5) * 0.95 + Math.cos(z * 0.12) * 0.35;
+    const lagoonBulge = 6.2 * Math.exp(-Math.pow((z - LAGOON_Z) / 8.2, 2));
+    return baseHalf + lagoonBulge;
   }
 
   /**
@@ -106,8 +112,17 @@ export class Terrain {
   }
 
   /**
-   * Multi-octave 5-layer Simplex noise heightfield with meandering stream channel carving
-   * and flat central mossy campfire clearing.
+   * World-space center of the deep swimming lagoon floor at LAGOON_Z (29.0).
+   */
+  getLagoonCenter3D(target = new THREE.Vector3()) {
+    const cx = this.getStreamCenterX(LAGOON_Z);
+    const y = this.getHeightAt(cx, LAGOON_Z);
+    return target.set(cx, y, LAGOON_Z);
+  }
+
+  /**
+   * Multi-octave 5-layer Simplex noise heightfield with meandering stream channel carving,
+   * deep downstream swimming lagoon, and flat central mossy campfire clearing.
    */
   getHeightAt(x, z) {
     // 5 octaves of Simplex noise for rolling forest hills and ridges
@@ -139,24 +154,34 @@ export class Terrain {
       h = lerp(h, clearingTargetY, clearBlend);
     }
 
-    // Carve meandering valley & stream bed smoothly below y = 0
+    // Carve meandering valley, shallow wading stream & scenic deep swimming lagoon (z = 29.0)
     const distStream = this.getStreamDistance(x, z);
     const halfW = this.getStreamHalfWidth(z);
     const valleyWidth = halfW + 13.5;
 
     if (distStream < valleyWidth) {
-      // Gentle outer valley bank slope bringing surrounding hills down toward the stream
+      const lagoonMask = Math.exp(-Math.pow((z - LAGOON_Z) / 7.5, 2));
+
+      // Gentle outer valley bank slope bringing surrounding hills down toward the stream & lagoon beaches
       const bankT = smootherstep(halfW * 0.85, valleyWidth, distStream);
-      const bankTarget = 0.35 + (distStream - halfW) * 0.14;
-      const valleyBlend = (1.0 - bankT) * 0.86;
+      const bankTarget =
+        lerp(0.35, 0.22, lagoonMask) + (distStream - halfW) * lerp(0.14, 0.11, lagoonMask);
+      const valleyBlend = (1.0 - bankT) * lerp(0.86, 0.93, lagoonMask);
       h = lerp(h, Math.min(h, Math.max(bankTarget, -0.2)), valleyBlend);
 
-      // Inner river channel carving below WATER_LEVEL (y = 0) to a realistic knee-to-thigh wading depth
+      // Inner river channel carving below WATER_LEVEL (y = 0):
+      // knee-to-thigh wading depth (-0.76) along the stream, smoothly deepening to -3.25 in the
+      // lagoon with gentle sloping sandy/pebble beach shelves for seamless wading -> swimming -> diving.
       if (distStream < halfW * 1.45) {
-        const channelT = smootherstep(0.0, halfW * 1.38, distStream);
-        const bedRipples = this._noiseDetail(x * 0.28, z * 0.28) * 0.11;
-        const bedDepth = -0.76 + bedRipples;
-        const carved = lerp(bedDepth, 0.42, channelT);
+        const rawChannelT = smootherstep(0.0, halfW * 1.38, distStream);
+        const channelT =
+          lagoonMask > 0.001
+            ? lerp(rawChannelT, Math.pow(rawChannelT, 1.16), lagoonMask)
+            : rawChannelT;
+        const bedRipples = this._noiseDetail(x * 0.28, z * 0.28) * lerp(0.11, 0.045, lagoonMask);
+        const bedDepth = lerp(-0.76, -3.25, lagoonMask) + bedRipples;
+        const shoreEdgeY = lerp(0.42, 0.28, lagoonMask);
+        const carved = lerp(bedDepth, shoreEdgeY, channelT);
         const carveMask = 1.0 - smootherstep(halfW * 0.92, halfW * 1.45, distStream);
         h = lerp(h, Math.min(h, carved), carveMask);
       }
@@ -657,12 +682,13 @@ export class Terrain {
         float localWet = clamp( max( shoreWet, uWetness ), 0.0, 1.0 );
         blendedAlbedo *= mix( 1.0, 0.58, localWet * 0.85 );
 
-        // Subtle projected caustics on shallow riverbed below water surface
+        // Projected caustics on shallow riverbed and deep lagoon shelves below water surface
         if ( vTerrainWorldPos.y < uWaterLevel + 0.03 ) {
           float waterDepth = max( uWaterLevel - vTerrainWorldPos.y, 0.0 );
-          float depthFade = exp( -waterDepth * 1.15 ) * smoothstep( 0.0, 0.08, waterDepth + 0.02 );
+          float depthFade = exp( -waterDepth * 0.78 ) * smoothstep( 0.0, 0.08, waterDepth + 0.02 );
           float caust = riverbedCaustics( vTerrainWorldPos.xz, uTime );
-          blendedAlbedo += vec3( 0.28, 0.42, 0.36 ) * caust * depthFade * max( uSunIntensity, 0.12 ) * 0.65;
+          vec3 causticCol = mix( vec3( 0.26, 0.46, 0.42 ), vec3( 0.08, 0.30, 0.36 ), smoothstep( 0.8, 3.0, waterDepth ) );
+          blendedAlbedo += causticCol * caust * depthFade * max( uSunIntensity, 0.12 ) * 0.68;
         }
 
         diffuseColor.rgb *= blendedAlbedo;

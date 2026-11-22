@@ -18,6 +18,7 @@ import { InputManager } from './input/InputManager.js';
 import { MobileControls, detectMobilePerformanceProfile } from './ui/MobileControls.js';
 import { HumanController } from './character/HumanController.js';
 import { ForestWildlife } from './wildlife/ForestWildlife.js';
+import { GameSystems } from './game/GameSystems.js';
 
 const WEATHER_PRESETS = {
   Clear: { rain: 0.0, wetness: 0.0, windMult: 1.0, gustMult: 1.0 },
@@ -30,6 +31,12 @@ const QUALITY_PIXEL_RATIO = {
   High: 1.75,
   Ultra: 2.0,
 };
+
+const UNDERWATER_FOG_COLOR = new THREE.Color(0x094c60);
+const _playerPos = new THREE.Vector3();
+const _camForward = new THREE.Vector3();
+const _lagoonPos = new THREE.Vector3();
+const _swapPos = new THREE.Vector3();
 
 function formatClock(hours) {
   const normalized = ((hours % 24) + 24) % 24;
@@ -46,7 +53,7 @@ function getDayPhaseLabel(hours) {
   if (h >= 15.5 && h < 17.6) return 'Afternoon';
   if (h >= 17.6 && h < 19.8) return 'Sunset';
   if (h >= 19.8 && h < 21.3) return 'Twilight';
-  return 'Moonlit Night';
+  return 'Aurora Night';
 }
 
 function nextPaint() {
@@ -55,6 +62,7 @@ function nextPaint() {
 
 async function bootstrapForest() {
   const viewport = document.getElementById('viewport');
+  const underwaterOverlay = document.getElementById('underwater-overlay');
   const loadingScreen = document.getElementById('loading-screen');
   const loadingStatus = document.getElementById('loading-status');
   const loadingBarFill = document.getElementById('loading-bar-fill');
@@ -86,7 +94,6 @@ async function bootstrapForest() {
     if (loadingStatus && msg) loadingStatus.textContent = msg;
   };
 
-  // Detect mobile performance profile & touch capability upfront
   const mobileProfile = detectMobilePerformanceProfile();
 
   // Shared reactive simulation state bound to ControlPanel
@@ -100,6 +107,7 @@ async function bootstrapForest() {
     windSpeed: 1.0,
     windDirection: 25,
     gustTurbulence: 0.55,
+    character: 'liam',
     cameraMode: 'Third-Person',
     sprintSpeed: 1.0,
     infiniteStamina: false,
@@ -108,7 +116,6 @@ async function bootstrapForest() {
     quality: mobileProfile.recommendedQuality || 'High',
   };
 
-  // Smoothly interpolated weather transition state
   const weatherState = {
     rainIntensity: 0.0,
     wetness: 0.0,
@@ -120,9 +127,7 @@ async function bootstrapForest() {
   await nextPaint();
 
   const engine = new Engine(viewport);
-  if (mobileProfile.isMobile) {
-    engine.setMaxPixelRatio(Math.min(mobileProfile.maxPixelRatio, 1.75));
-  }
+  engine.setMaxPixelRatio(mobileProfile.isMobile ? 1.75 : 2.0);
 
   const windSystem = new WindSystem({
     windSpeed: simState.windSpeed,
@@ -130,7 +135,7 @@ async function bootstrapForest() {
     gustTurbulence: simState.gustTurbulence,
   });
 
-  setProgress(24, 'Sculpting terrain, cabin, bridge, redwood & stone cavern…');
+  setProgress(24, 'Sculpting valley, lagoon, cabin, bridge, redwood & cavern…');
   await nextPaint();
 
   const terrain = new Terrain(4242);
@@ -145,12 +150,12 @@ async function bootstrapForest() {
 
   const skyLighting = new SkyLighting(engine.scene, engine.renderer, terrain);
 
-  setProgress(44, 'Growing pines, oaks & birches around forest structures…');
+  setProgress(44, 'Growing ancient pines, gnarled oaks & silver birches…');
   await nextPaint();
 
   const treeFactory = new TreeFactory(engine.scene, terrain, windSystem, structures.exclusionZones);
 
-  setProgress(64, 'Scattering meadow, clover, twigs, pebbles & mushrooms…');
+  setProgress(62, 'Scattering meadow, clover, twigs, pebbles & mushrooms…');
   await nextPaint();
 
   const undergrowth = new Undergrowth(
@@ -165,17 +170,19 @@ async function bootstrapForest() {
 
   const audio = new ProceduralAudio({ volume: parseFloat(audioVolumeSlider?.value || '0.72') });
 
-  setProgress(80, 'Rigging explorer, Foot IK, wildlife & multi-touch HUD…');
+  setProgress(78, 'Binding skinned characters, Foot IK, wildlife & ancient relics…');
   await nextPaint();
 
   // HUD & subsystem references
   let isPointerLocked = false;
   let lastClockText = '';
   let lastPhaseText = '';
+  let wasCameraUnderwater = false;
   let controlPanel = null;
   let wildlife = null;
   let human = null;
   let mobileControls = null;
+  let gameSystems = null;
 
   const updateAudioUI = () => {
     const muted = audio.isMuted();
@@ -207,11 +214,14 @@ async function bootstrapForest() {
     onPromptChange: (text, isInteractive) => updatePromptUI(text, isInteractive),
   });
 
-  // Unified device-agnostic InputManager (Keyboard + Mouse + Multi-Touch)
+  // Unified device-agnostic InputManager (Keyboard + Mouse + Multi-Touch + Tab/1-4)
   const inputManager = new InputManager(engine.renderer.domElement, {
     onJump: () => human?.triggerJump(),
     onRatScare: () => wildlife?.triggerRatScare(human),
     onCameraCycle: () => human?.cycleCameraMode(),
+    onCharacterSwitch: () => human?.cycleCharacter(),
+    onEmote: (id) => human?.playEmote(id),
+    onEmoteCycle: () => human?.cycleEmote(),
     onFirstUserGesture: () => audio.unlock(),
     isHoveringInteractive: () => controls.isHoveringInteractive(),
     getCameraMode: () => human?.getCameraMode() || 'Third-Person',
@@ -224,7 +234,6 @@ async function bootstrapForest() {
     },
   });
 
-  // Responsive multi-touch overlay (auto-shows on touch devices, toggleable on desktop via lil-gui)
   mobileControls = new MobileControls(inputManager);
   const applyTouchVisibility = (visible) => {
     const show = Boolean(visible);
@@ -248,11 +257,11 @@ async function bootstrapForest() {
     }
 
     if (mode === 'Free Orbit' && human) {
-      const hp = human.getPosition(new THREE.Vector3());
-      controls.orbitControls.target.set(hp.x, hp.y + 1.25, hp.z);
-      const camX = hp.x + 6.2;
-      const camZ = hp.z + 5.6;
-      const camY = Math.max(terrain.getHeightAt(camX, camZ) + 2.4, hp.y + 3.4);
+      human.getPosition(_playerPos);
+      controls.orbitControls.target.set(_playerPos.x, _playerPos.y + 1.25, _playerPos.z);
+      const camX = _playerPos.x + 6.2;
+      const camZ = _playerPos.z + 5.6;
+      const camY = Math.max(terrain.getHeightAt(camX, camZ) + 2.4, _playerPos.y + 3.4);
       engine.camera.position.set(camX, camY, camZ);
       controls.orbitControls.update();
     }
@@ -269,12 +278,22 @@ async function bootstrapForest() {
     audio,
     {
       onCameraModeChange: (mode) => syncCameraModeUI(mode),
+      onCharacterSwitched: (id, pos) => {
+        simState.character = id;
+        controlPanel?.sync();
+        if (pos && gameSystems) {
+          _swapPos.set(pos.x, pos.y + 0.95, pos.z);
+          gameSystems.spawnSwapBurst(_swapPos);
+        }
+      },
     },
-    { inputManager, surfaceSolver }
+    { inputManager, surfaceSolver, initialCharacter: simState.character }
   );
 
   wildlife = new ForestWildlife(engine.scene, terrain, treeFactory.treePositions, audio);
   wildlife.setSurfaceSolver(surfaceSolver);
+
+  gameSystems = new GameSystems(engine.scene, terrain, surfaceSolver, structures, audio);
 
   // Connect Rain lightning thunderclaps to rolling thunder audio & human startle flinch
   skyLighting.setThunderCallback((intensity) => {
@@ -299,7 +318,7 @@ async function bootstrapForest() {
     particles.setQuality(preset);
     const maxDpr = mobileProfile.isMobile
       ? Math.min(QUALITY_PIXEL_RATIO[preset] ?? 1.5, 1.75)
-      : QUALITY_PIXEL_RATIO[preset] ?? 1.75;
+      : Math.min(QUALITY_PIXEL_RATIO[preset] ?? 1.75, 2.0);
     engine.setMaxPixelRatio(maxDpr);
     syncColliders();
   };
@@ -332,18 +351,26 @@ async function bootstrapForest() {
       human.resetPositionAndCamera();
       return;
     }
+    if (name === 'deepLagoon') {
+      terrain.getLagoonCenter3D(_lagoonPos);
+      human.teleportTo({ x: _lagoonPos.x, y: -1.34, z: _lagoonPos.z }, 0);
+      return;
+    }
     const wp = structures.waypoints?.[name];
     if (wp) {
-      human.teleportTo(wp.pos || wp, Number.isFinite(wp.yaw) ? wp.yaw : null);
+      human.teleportTo(wp.position || wp, Number.isFinite(wp.yaw) ? wp.yaw : null);
       if (simState.cameraMode === 'Free Orbit') {
-        const hp = human.getPosition(new THREE.Vector3());
-        controls.orbitControls.target.set(hp.x, hp.y + 1.2, hp.z);
+        human.getPosition(_playerPos);
+        controls.orbitControls.target.set(_playerPos.x, _playerPos.y + 1.2, _playerPos.z);
         controls.orbitControls.update();
       }
     }
   };
 
   controlPanel = new ControlPanel(simState, {
+    onCharacterSwitch: (id) => human.switchCharacter(id),
+    onCycleCharacter: () => human.cycleCharacter(),
+    onEmote: (id) => human.playEmote(id),
     onCameraModeChange: (mode) => human.setCameraMode(mode),
     onToggleTouchControls: (visible) => applyTouchVisibility(visible),
     onTeleport: (loc) => teleportToLocation(loc),
@@ -419,15 +446,12 @@ async function bootstrapForest() {
     });
   }
 
-  // Reusable scratch vector
-  const playerPos = new THREE.Vector3();
-
   // Fixed-step update for 3D boid bird flock
   engine.onFixedUpdate((fixedDt, elapsed) => {
     controls.updateFixed(fixedDt, elapsed);
   });
 
-  // Main per-frame simulation loop
+  // Main per-frame simulation loop (zero per-frame heap allocations!)
   engine.onUpdate((dt, elapsed) => {
     // 1. Advance 24h cycle
     if (simState.autoCycle && simState.cycleSpeed > 0) {
@@ -450,26 +474,34 @@ async function bootstrapForest() {
     windSystem.update(dt, elapsed);
     human.setRainWetness(weatherState.wetness);
 
-    // 3. Update playable human character, SurfaceSolver, Foot IK, shelter & camera
+    // 3. Update playable skinned character, SurfaceSolver, Swimming/Diving, Foot IK & camera
     human.update(dt, elapsed);
-    human.getPosition(playerPos);
+    human.getPosition(_playerPos);
 
-    // Sync touch HUD button states (RUN / CROUCH / CAM badge)
     if (mobileControls.isVisible()) {
       mobileControls.syncButtonStates({
         sprinting: human.isSprintingInput(),
         crouching: human.isCrouching(),
         cameraMode: human.getCameraMode(),
+        inDeepWater: human.isInDeepWater(),
+        characterName: human.getCharacterShortName(),
       });
     }
 
-    // 4. Update forest wildlife (rats including indoors, tree squirrels, meadow rabbits)
+    // 4. Update RPG Relics & Top-Center Compass Bar
+    engine.camera.getWorldDirection(_camForward);
+    gameSystems.update(dt, elapsed, {
+      playerPos: _playerPos,
+      cameraForward: _camForward,
+    });
+
+    // 5. Update forest wildlife (rats including indoors, squirrels, rabbits)
     wildlife.update(dt, elapsed, human);
 
-    // 5. Update interactive campfire, birds, and Free Orbit/click raycasting
+    // 6. Update interactive campfire, birds & Free Orbit raycasting
     controls.update(dt, elapsed);
 
-    // 6. Update 24h sky, sun/moon, lightning flashes, fog & volumetric sunbeams
+    // 7. Update extreme atmospheric sky, clouds, Milky Way, Aurora, dynamic PMREM & sunbeams
     const sky = skyLighting.update(dt, elapsed, {
       timeOfDay: simState.timeOfDay,
       weather: simState.weather,
@@ -478,16 +510,31 @@ async function bootstrapForest() {
       camera: engine.camera,
     });
 
-    engine.setExposure(sky.recommendedExposure);
+    // Apply Underwater View overrides (rich teal-blue exponential fog + caustic veil + muffled audio!)
+    const camUnderwater = human.isCameraUnderwater();
+    if (camUnderwater !== wasCameraUnderwater) {
+      wasCameraUnderwater = camUnderwater;
+      audio.setUnderwater(camUnderwater);
+      if (underwaterOverlay) {
+        underwaterOverlay.classList.toggle('active', camUnderwater);
+      }
+    }
+    if (camUnderwater && engine.scene.fog) {
+      engine.scene.fog.color.copy(UNDERWATER_FOG_COLOR).multiplyScalar(0.55 + sky.daylight * 0.65);
+      engine.scene.fog.density = 0.088;
+      engine.setExposure(sky.recommendedExposure * 0.96);
+    } else {
+      engine.setExposure(sky.recommendedExposure);
+    }
     engine.setBloomConfig({ strength: sky.recommendedBloomStrength });
 
-    // 7. Update walkable structure lanterns, window spill, cave crystals & redwood sunbeams
+    // 8. Update walkable structures (lanterns, window spill, cave crystals, redwood sunbeams)
     structures.update(dt, elapsed, {
       nightFactor: sky.nightFactor,
       daylight: sky.daylight,
     });
 
-    // 8. Update terrain & meandering stream water (with bridge-piling foam & splash ripples)
+    // 9. Update terrain & ultra-realistic water (Gerstner + Voronoi caustics + Snell's Window + piling foam)
     terrain.update(elapsed, {
       sunDir: sky.sunDir,
       sunIntensity: sky.sunIntensity,
@@ -500,13 +547,13 @@ async function bootstrapForest() {
       skyZenithColor: sky.skyZenithColor,
       skyHorizonColor: sky.skyHorizonColor,
       sunIntensity: sky.sunIntensity,
-      fogColor: sky.fogColor,
-      fogDensity: sky.fogDensity,
+      fogColor: camUnderwater ? engine.scene.fog.color : sky.fogColor,
+      fogDensity: camUnderwater ? engine.scene.fog.density : sky.fogDensity,
       rainIntensity: weatherState.rainIntensity,
       windSpeed: windSystem.uniforms.uWindSpeed.value,
     });
 
-    // 9. Update undergrowth & atmospheric particles (rain occluded inside shelters!)
+    // 10. Update undergrowth & atmospheric particles
     undergrowth.update(dt, elapsed, {
       nightFactor: sky.nightFactor,
       wetness: weatherState.wetness,
@@ -521,8 +568,8 @@ async function bootstrapForest() {
       windSpeed: windSystem.uniforms.uWindSpeed.value,
     });
 
-    // 10. Update procedural Web Audio soundscape around explorer position
-    const listenerPos = simState.cameraMode === 'Free Orbit' ? engine.camera.position : playerPos;
+    // 11. Update procedural Web Audio soundscape
+    const listenerPos = simState.cameraMode === 'Free Orbit' ? engine.camera.position : _playerPos;
     const localGust = windSystem.sampleGustAt(listenerPos.x, listenerPos.z);
     const streamDistance = terrain.getStreamDistance(listenerPos.x, listenerPos.z);
     const campfireDistance = listenerPos.distanceTo(controls.campfirePos);
@@ -538,7 +585,7 @@ async function bootstrapForest() {
       rainIntensity: weatherState.rainIntensity,
     });
 
-    // 11. Update auto-hiding HUD Stamina bar & contextual reaction/shelter alert
+    // 12. Update auto-hiding HUD Stamina bar & contextual reaction/swim/shelter alerts
     const stamina = human.getStamina();
     const exhausted = human.isExhausted();
     const showStamina = !simState.infiniteStamina && (stamina < 99.4 || exhausted);
@@ -577,11 +624,17 @@ async function bootstrapForest() {
     } else if (stateName === 'ThunderFlinch') {
       badgeMsg = 'Startled by thunderclap!';
       isCalmStyle = true;
+    } else if (human.isSubmerged()) {
+      badgeMsg = 'Underwater Diving — Hold Space / UP to Surface';
+      isCalmStyle = true;
+    } else if (human.isSwimming()) {
+      badgeMsg = 'Swimming in Deep Lagoon — Press C / DIVE to Submerge';
+      isCalmStyle = true;
     } else if (shelter?.sheltered) {
       const labels = {
-        cabin: 'Inside Rustic Ranger Cabin — Sheltered',
-        redwood: 'Inside Hollow Giant Redwood — Sheltered',
-        cavern: 'Inside Mossy Stone Cavern — Echoing Shelter',
+        ranger_cabin: 'Inside Rustic Ranger Cabin — Sheltered',
+        hollow_redwood: 'Inside Hollow Giant Redwood — Sheltered',
+        mossy_cavern: 'Inside Mossy Stone Cavern — Echoing Shelter',
       };
       badgeMsg = labels[shelter.structureId] || 'Sheltered Indoors';
       isCalmStyle = true;
@@ -595,7 +648,7 @@ async function bootstrapForest() {
       reactionText.textContent = badgeMsg;
     }
 
-    // 12. Refresh HUD clock & phase text
+    // 13. Refresh HUD clock & phase text
     const clockStr = formatClock(simState.timeOfDay);
     if (clockStr !== lastClockText) {
       lastClockText = clockStr;
@@ -626,6 +679,7 @@ async function bootstrapForest() {
     mobileControls,
     human,
     wildlife,
+    gameSystems,
     audio,
     controlPanel,
     setTimeOfDay(hours) {
@@ -648,6 +702,15 @@ async function bootstrapForest() {
     },
     setCameraMode(mode) {
       human.setCameraMode(mode);
+    },
+    switchCharacter(id) {
+      return human.switchCharacter(id);
+    },
+    cycleCharacter() {
+      return human.cycleCharacter();
+    },
+    playEmote(id) {
+      return human.playEmote(id);
     },
     setShowTouchControls(visible) {
       applyTouchVisibility(visible);
@@ -674,6 +737,13 @@ async function bootstrapForest() {
       const gl = engine.renderer.getContext();
       return gl ? gl.getError() : -1;
     },
+    getMemoryInfo() {
+      return {
+        geometries: engine.renderer.info.memory.geometries,
+        textures: engine.renderer.info.memory.textures,
+        programs: engine.renderer.info.programs?.length ?? 0,
+      };
+    },
     getSceneStats() {
       const info = engine.renderer.info;
       const hp = human.getPosition(new THREE.Vector3());
@@ -683,17 +753,22 @@ async function bootstrapForest() {
         programs: info.programs?.length ?? 0,
         geometries: info.memory.geometries,
         textures: info.memory.textures,
+        character: human.getCharacterId(),
+        characterName: human.getCharacterName(),
         cameraMode: human.getCameraMode(),
         humanState: human.getStateName(),
         surfaceType: human.getCurrentSurfaceType(),
+        swimming: human.isSwimming(),
+        submerged: human.isSubmerged(),
+        cameraUnderwater: human.isCameraUnderwater(),
         shelter: human.getShelterState(),
+        relicsCollected: gameSystems.getCollectedCount(),
+        relicsTotal: gameSystems.getTotalCount(),
         humanPos: { x: Number(hp.x.toFixed(2)), y: Number(hp.y.toFixed(2)), z: Number(hp.z.toFixed(2)) },
         stamina: Number(human.getStamina().toFixed(1)),
         panic: human.getPanicInfo(),
         touchVisible: mobileControls.isVisible(),
-        wildlife: wildlife.getStats(),
-        bridgePilings: structures.bridgePilings.length,
-        shelterBoxes: surfaceSolver.getShelterBoxes().length,
+        hasEnvironment: Boolean(engine.scene.environment),
         timeOfDay: simState.timeOfDay,
         weather: simState.weather,
         quality: simState.quality,
@@ -701,7 +776,7 @@ async function bootstrapForest() {
     },
   };
 
-  setProgress(100, 'Compiling forest, interior & character shaders…');
+  setProgress(100, 'Compiling skinned characters, extreme sky & water shaders…');
   engine.start();
 
   await nextPaint();

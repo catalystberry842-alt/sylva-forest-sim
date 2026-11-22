@@ -53,6 +53,7 @@ export class InputManager {
       left: false,
       right: false,
       sprint: false,
+      jump: false,
     };
 
     // Crouch states (keyboard toggle, keyboard hold, mobile touch toggle)
@@ -65,6 +66,7 @@ export class InputManager {
     this._touchMoveY = 0;
     this._touchAutoSprint = false;
     this._touchSprint = false;
+    this._touchJump = false;
 
     // Unified look & zoom accumulators (consumed per frame by HumanController)
     this._lookDeltaX = 0;
@@ -82,6 +84,7 @@ export class InputManager {
 
     // One-shot first user gesture notification (e.g., Web Audio unlock)
     this._firstGestureFired = false;
+    this._emoteCycleIndex = 0;
     this._disposed = false;
 
     this._bindEvents();
@@ -146,6 +149,7 @@ export class InputManager {
           break;
         case 'Space':
           e.preventDefault?.();
+          this._keys.jump = true;
           if (!e.repeat) {
             this.callbacks.onJump?.();
           }
@@ -179,6 +183,23 @@ export class InputManager {
             this.callbacks.onCameraCycle?.();
           }
           break;
+        case 'Tab':
+          if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+            e.preventDefault?.();
+            if (!e.repeat) {
+              this.callbacks.onCharacterSwitch?.();
+            }
+          }
+          break;
+        case 'Digit1':
+        case 'Digit2':
+        case 'Digit3':
+        case 'Digit4':
+          if (!e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            const emoteId = e.code.charCodeAt(5) - 48; // 1 | 2 | 3 | 4
+            this.callbacks.onEmote?.(emoteId);
+          }
+          break;
         default:
           break;
       }
@@ -205,6 +226,9 @@ export class InputManager {
         case 'ShiftLeft':
         case 'ShiftRight':
           this._keys.sprint = false;
+          break;
+        case 'Space':
+          this._keys.jump = false;
           break;
         case 'ControlLeft':
         case 'ControlRight': {
@@ -356,12 +380,14 @@ export class InputManager {
     this._keys.left = false;
     this._keys.right = false;
     this._keys.sprint = false;
+    this._keys.jump = false;
     this._crouchHeld = false;
 
     this._touchMoveX = 0;
     this._touchMoveY = 0;
     this._touchAutoSprint = false;
     this._touchSprint = false;
+    this._touchJump = false;
 
     this._isDraggingMouse = false;
     this._mousePointerId = null;
@@ -425,6 +451,14 @@ export class InputManager {
     }
   }
 
+  setTouchJump(active) {
+    this._touchJump = Boolean(active);
+  }
+
+  isJumpHeld() {
+    return Boolean(this._keys.jump || this._touchJump);
+  }
+
   triggerJump() {
     this._notifyFirstGesture();
     this.callbacks.onJump?.();
@@ -450,6 +484,28 @@ export class InputManager {
   triggerCameraCycle() {
     this._notifyFirstGesture();
     this.callbacks.onCameraCycle?.();
+  }
+
+  triggerCharacterSwitch() {
+    this._notifyFirstGesture();
+    this.callbacks.onCharacterSwitch?.();
+  }
+
+  triggerEmote(emoteId) {
+    this._notifyFirstGesture();
+    const id = clamp(Math.round(Number(emoteId) || 1), 1, 4);
+    this.callbacks.onEmote?.(id);
+    return id;
+  }
+
+  triggerEmoteCycle() {
+    this._notifyFirstGesture();
+    if (typeof this.callbacks.onEmoteCycle === 'function') {
+      return this.callbacks.onEmoteCycle();
+    }
+    this._emoteCycleIndex = (this._emoteCycleIndex % 4) + 1;
+    this.callbacks.onEmote?.(this._emoteCycleIndex);
+    return this._emoteCycleIndex;
   }
 
   // ---------------------------------------------------------------------------

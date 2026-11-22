@@ -129,15 +129,12 @@ export class Engine {
     if (this._running) return;
     this._running = true;
     this._lastTime = performance.now();
-    this._rafId = requestAnimationFrame(this._boundLoop);
+    this.renderer.setAnimationLoop(this._boundLoop);
   }
 
   stop() {
     this._running = false;
-    if (this._rafId !== null) {
-      cancelAnimationFrame(this._rafId);
-      this._rafId = null;
-    }
+    this.renderer.setAnimationLoop(null);
   }
 
   _handleResize() {
@@ -158,12 +155,12 @@ export class Engine {
 
   _loop(now) {
     if (!this._running) return;
-    this._rafId = requestAnimationFrame(this._boundLoop);
+    const timestamp = typeof now === 'number' && now > 0 ? now : performance.now();
 
     if (this._stats) this._stats.begin();
 
-    const rawDt = (now - this._lastTime) * 0.001;
-    this._lastTime = now;
+    const rawDt = (timestamp - this._lastTime) * 0.001;
+    this._lastTime = timestamp;
     const dt = Math.min(Math.max(rawDt, 0.0001), 0.05);
     this._elapsed += dt;
 

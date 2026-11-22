@@ -55,6 +55,10 @@ export class ProceduralAudio {
     this._caveFeedbackGain = null;
     this._caveWetGain = null;
 
+    // Master underwater low-pass filter (dry 20000 Hz <-> underwater 360 Hz, Q = 0.7)
+    this._isUnderwater = false;
+    this._underwaterFilter = null;
+
     // Stochastic event schedulers
     this._nextCrackleTimer = 0.08;
     this._nextBubbleTimer = 0.22;
@@ -133,6 +137,30 @@ export class ProceduralAudio {
   }
 
   /**
+   * Smoothly ramps the master underwater low-pass filter (20000 Hz dry <-> 360 Hz submerged)
+   * and gently attenuates outdoor bird & wind highs while diving beneath the surface.
+   */
+  setUnderwater(isUnderwater) {
+    this._isUnderwater = Boolean(isUnderwater);
+    this._applyUnderwater(0.14);
+    return this._isUnderwater;
+  }
+
+  isUnderwater() {
+    return this._isUnderwater;
+  }
+
+  _applyUnderwater(tau = 0.14) {
+    if (!this._ctx) return;
+    const now = this._ctx.currentTime;
+    const cutoff = this._isUnderwater ? 360 : 20000;
+    if (this._underwaterFilter) {
+      this._underwaterFilter.frequency.setTargetAtTime(cutoff, now, tau);
+    }
+    this._applyAcousticZone(tau);
+  }
+
+  /**
    * Switches acoustic environment zone ('outdoor' | 'wood' | 'cave'):
    * - 'outdoor': full crisp canopy wind & rain, dry one-shots
    * - 'wood': softly dampens outdoor wind & rain (~0.42x) with warm timber shelter muffling
@@ -177,6 +205,11 @@ export class ProceduralAudio {
       caveWet = 0.42;
     }
 
+    if (this._isUnderwater) {
+      outdoorGain *= 0.42;
+      outdoorCutoff = Math.min(outdoorCutoff, 680);
+    }
+
     if (this._outdoorShelterGain) {
       this._outdoorShelterGain.gain.setTargetAtTime(outdoorGain, now, tau);
     }
@@ -202,7 +235,7 @@ export class ProceduralAudio {
     const ctx = this._ctx;
     const now = ctx.currentTime;
 
-    // Master mix -> gentle dynamics limiter -> master volume -> speakers
+    // Master mix -> gentle dynamics limiter -> master underwater low-pass -> master volume -> speakers
     this._mixBus = ctx.createGain();
     this._mixBus.gain.value = 0.95;
 
@@ -213,11 +246,17 @@ export class ProceduralAudio {
     this._compressor.attack.setValueAtTime(0.008, now);
     this._compressor.release.setValueAtTime(0.18, now);
 
+    this._underwaterFilter = ctx.createBiquadFilter();
+    this._underwaterFilter.type = 'lowpass';
+    this._underwaterFilter.frequency.setValueAtTime(20000, now);
+    this._underwaterFilter.Q.setValueAtTime(0.7, now);
+
     this._masterGain = ctx.createGain();
     this._masterGain.gain.setValueAtTime(0.0, now);
 
     this._mixBus.connect(this._compressor);
-    this._compressor.connect(this._masterGain);
+    this._compressor.connect(this._underwaterFilter);
+    this._underwaterFilter.connect(this._masterGain);
     this._masterGain.connect(ctx.destination);
 
     // Outdoor weather shelter sub-bus (muffles & dampens wind & rain in wood/cave zones)
@@ -384,8 +423,8 @@ export class ProceduralAudio {
     fireFilter.connect(this._fireRumbleGain);
     this._fireRumbleGain.connect(this._mixBus);
 
-    // Apply any acoustic zone configured before audio unlock
-    this._applyAcousticZone(0.02);
+    // Apply any acoustic zone & underwater state configured before audio unlock
+    this._applyUnderwater(0.02);
   }
 
   _createLoopingSource(buffer, offsetSeconds = 0) {
@@ -820,12 +859,13 @@ export class ProceduralAudio {
       }
     }
 
-    // Daytime melodic bird chirps (suppressed during heavy rain)
+    // Daytime melodic bird chirps (suppressed during heavy rain & gently attenuated underwater)
     const birdActivity = clamp((daylight - 0.35) / 0.45, 0, 1) * clamp(1.0 - rain * 1.15, 0, 1);
     if (birdActivity > 0.08) {
       this._nextBirdTimer -= safeDt * (0.65 + birdActivity * 0.65);
       if (this._nextBirdTimer <= 0) {
-        this._triggerAmbientBirdChirp(0.55 + birdActivity * 0.45);
+        const submergeScale = this._isUnderwater ? 0.25 : 1.0;
+        this._triggerAmbientBirdChirp((0.55 + birdActivity * 0.45) * submergeScale);
         this._nextBirdTimer = 2.6 + Math.random() * 4.4;
       }
     }
@@ -835,7 +875,7 @@ export class ProceduralAudio {
     if (cricketActivity > 0.08) {
       this._nextCricketTimer -= safeDt;
       if (this._nextCricketTimer <= 0) {
-        this._triggerCricketBurst(cricketActivity);
+        this._triggerCricketBurst(cricketActivity * (this._isUnderwater ? 0.25 : 1.0));
         // Slightly denser overlapping chorus as night deepens
         this._nextCricketTimer = lerp(0.95, 0.42, cricketActivity) + Math.random() * 0.48;
       }
@@ -883,13 +923,16 @@ export class ProceduralAudio {
   }
 
   /**
-   * Synthesizes a surface-aware character footstep:
-   * - 'wood': warm hollow timber plank resonance + boot sole tap
-   * - 'bridge': deeper woody span thump + slight wooden plank creak
-   * - 'stone': crisp hard-heel mineral tap + tight cavern stone click
-   * - 'grass': soft filtered foliage rustle (900–2400 Hz) + muted low heel thud (~95 Hz)
-   * - 'dirt' / 'rock': crisp gritty gravel crunch (1800–4200 Hz) + punchy footfall thump (~110 Hz)
-   * - 'water': frothy bandpass splash burst (600–2800 Hz) + shimmering droplet tail
+   * Synthesizes a warm, organic, surface-aware character footstep with ZERO resonant
+   * metallic ringing (strictly Q <= 0.72 lowpass/highpass filters, zero bandpass or
+   * triangle oscillators):
+   *  1. Soft Body-Weight Thud: 45ms sine pitch drop (105 -> 38 Hz ±10%) through a warm 170 Hz LP (Q=0.7)
+   *  2. Natural Surface Texture: 10ms-attack / 60ms-decay gently filtered pink/brown noise
+   *     - 'grass' / 'moss': organic leaf/blade swish (HP 280 Hz -> LP 1350 Hz)
+   *     - 'dirt': warm earthy soil crunch (pink + touch of brown, HP 220 Hz -> LP 1550 Hz)
+   *     - 'wood' / 'bridge': warm damped timber body (brown LP 210 Hz) + soft dull sole tap (pink LP 760 Hz)
+   *     - 'stone' / 'rock': natural dry grit scuff (HP 340 Hz -> LP 1950 Hz)
+   *     - 'water': smooth splashy foam burst (pink LP 2200 Hz, Q=0.65) + gentle water trickle
    */
   playFootstep({ surface = 'grass', intensity = 0.7 } = {}) {
     if (!this._canPlayOneShots()) return;
@@ -902,443 +945,264 @@ export class ProceduralAudio {
     this._footstepSide = -this._footstepSide;
     const pan = this._footstepSide * 0.14 + (Math.random() - 0.5) * 0.06;
 
-    if (surf === 'wood') {
-      // 1. Warm hollow cabin floorboard timber resonance (primary + overtone body modes)
-      const bodyOscA = ctx.createOscillator();
-      bodyOscA.type = 'triangle';
-      const baseFreq = 162 + (Math.random() - 0.5) * 26;
-      bodyOscA.frequency.setValueAtTime(baseFreq, now);
-      bodyOscA.frequency.exponentialRampToValueAtTime(baseFreq * 0.58, now + 0.088);
+    // Subtle per-step ±10% pitch & gain randomization so repeated steps feel natural
+    const pitchRand = 0.9 + Math.random() * 0.2;
+    const gainRand = 0.9 + Math.random() * 0.2;
 
-      const bodyOscB = ctx.createOscillator();
-      bodyOscB.type = 'sine';
-      const overtoneFreq = baseFreq * (1.84 + Math.random() * 0.18);
-      bodyOscB.frequency.setValueAtTime(overtoneFreq, now);
-      bodyOscB.frequency.exponentialRampToValueAtTime(overtoneFreq * 0.64, now + 0.065);
+    // -------------------------------------------------------------------------
+    // Layer 1: Soft Body-Weight Thud (45ms sine drop 105 -> 38 Hz via warm 170 Hz LP, Q=0.7)
+    // -------------------------------------------------------------------------
+    let thudBaseGain = 0.135;
+    if (surf === 'wood') thudBaseGain = 0.2;
+    else if (surf === 'bridge') thudBaseGain = 0.22;
+    else if (surf === 'stone' || surf === 'rock') thudBaseGain = 0.165;
+    else if (surf === 'dirt') thudBaseGain = 0.155;
+    else if (surf === 'water') thudBaseGain = 0.105;
 
-      const woodBodyFilter = ctx.createBiquadFilter();
-      woodBodyFilter.type = 'bandpass';
-      woodBodyFilter.frequency.setValueAtTime(245 + Math.random() * 55, now);
-      woodBodyFilter.Q.setValueAtTime(1.85, now);
+    const thudOsc = ctx.createOscillator();
+    thudOsc.type = 'sine';
+    thudOsc.frequency.setValueAtTime(105 * pitchRand, now);
+    thudOsc.frequency.exponentialRampToValueAtTime(38 * pitchRand, now + 0.045);
+
+    const thudLP = ctx.createBiquadFilter();
+    thudLP.type = 'lowpass';
+    thudLP.frequency.setValueAtTime(170, now);
+    thudLP.Q.setValueAtTime(0.7, now);
+
+    const thudEnv = ctx.createGain();
+    const thudPeak = Math.max(0.0005, thudBaseGain * inten * gainRand);
+    thudEnv.gain.setValueAtTime(0.0001, now);
+    thudEnv.gain.linearRampToValueAtTime(thudPeak, now + 0.005);
+    thudEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.045);
+
+    thudOsc.connect(thudLP);
+    thudLP.connect(thudEnv);
+    this._connectToMix(thudEnv, pan, true);
+    thudOsc.start(now);
+    thudOsc.stop(now + 0.058);
+
+    // -------------------------------------------------------------------------
+    // Layer 2: Natural Surface Texture (10ms attack / 60ms decay, broad Q <= 0.72)
+    // -------------------------------------------------------------------------
+    const attackEnd = now + 0.01;
+    const decayEnd = now + 0.07; // 10ms attack + 60ms decay
+
+    if (surf === 'wood' || surf === 'bridge') {
+      // Warm damped timber thump: brown body (LP 210 Hz) + soft dull sole tap (pink LP 760 Hz)
+      const bodySrc = ctx.createBufferSource();
+      bodySrc.buffer = this._brownBuffer;
+      bodySrc.loop = true;
+
+      const bodyLP = ctx.createBiquadFilter();
+      bodyLP.type = 'lowpass';
+      const timberCutoff = (surf === 'bridge' ? 195 : 210) * pitchRand;
+      bodyLP.frequency.setValueAtTime(timberCutoff, now);
+      bodyLP.Q.setValueAtTime(0.7, now);
 
       const bodyEnv = ctx.createGain();
+      const bodyPeak = Math.max(0.0005, (surf === 'bridge' ? 0.24 : 0.21) * inten * gainRand);
       bodyEnv.gain.setValueAtTime(0.0001, now);
-      bodyEnv.gain.linearRampToValueAtTime(0.24 * inten, now + 0.0045);
-      bodyEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.098);
+      bodyEnv.gain.linearRampToValueAtTime(bodyPeak, attackEnd);
+      bodyEnv.gain.exponentialRampToValueAtTime(0.0001, decayEnd);
 
-      const overtoneGain = ctx.createGain();
-      overtoneGain.gain.setValueAtTime(0.42, now);
-
-      bodyOscA.connect(woodBodyFilter);
-      bodyOscB.connect(overtoneGain);
-      overtoneGain.connect(woodBodyFilter);
-      woodBodyFilter.connect(bodyEnv);
+      bodySrc.connect(bodyLP);
+      bodyLP.connect(bodyEnv);
       this._connectToMix(bodyEnv, pan, true);
+      bodySrc.start(now, Math.random() * 3.0);
+      bodySrc.stop(decayEnd + 0.02);
 
-      bodyOscA.start(now);
-      bodyOscB.start(now);
-      bodyOscA.stop(now + 0.11);
-      bodyOscB.stop(now + 0.09);
-
-      // 2. Crisp boot sole tap & warm plank knock transient
-      const knockSrc = ctx.createBufferSource();
-      knockSrc.buffer = this._pinkBuffer;
-      knockSrc.loop = true;
-
-      const knockFilter = ctx.createBiquadFilter();
-      knockFilter.type = 'bandpass';
-      knockFilter.frequency.setValueAtTime(620 + Math.random() * 190, now);
-      knockFilter.Q.setValueAtTime(2.9, now);
-
-      const knockEnv = ctx.createGain();
-      const knockDur = 0.048 + Math.random() * 0.016;
-      knockEnv.gain.setValueAtTime(0.0001, now);
-      knockEnv.gain.linearRampToValueAtTime(0.165 * inten, now + 0.003);
-      knockEnv.gain.exponentialRampToValueAtTime(0.0001, now + knockDur);
-
-      knockSrc.connect(knockFilter);
-      knockFilter.connect(knockEnv);
-      this._connectToMix(knockEnv, pan, true);
-      knockSrc.start(now, Math.random() * 3.0);
-      knockSrc.stop(now + knockDur + 0.015);
-
-      // 3. Boot sole leather/heel crisp top tap
+      // Soft dull leather/boot sole tap (zero harsh high-Q ringing)
       const soleSrc = ctx.createBufferSource();
-      soleSrc.buffer = this._whiteBuffer;
+      soleSrc.buffer = this._pinkBuffer;
       soleSrc.loop = true;
 
-      const soleFilter = ctx.createBiquadFilter();
-      soleFilter.type = 'bandpass';
-      soleFilter.frequency.setValueAtTime(1650 + Math.random() * 480, now);
-      soleFilter.frequency.exponentialRampToValueAtTime(840 + Math.random() * 180, now + 0.036);
-      soleFilter.Q.setValueAtTime(2.0, now);
+      const soleHP = ctx.createBiquadFilter();
+      soleHP.type = 'highpass';
+      soleHP.frequency.setValueAtTime(160 * pitchRand, now);
+      soleHP.Q.setValueAtTime(0.7, now);
+
+      const soleLP = ctx.createBiquadFilter();
+      soleLP.type = 'lowpass';
+      soleLP.frequency.setValueAtTime(760 * pitchRand, now);
+      soleLP.Q.setValueAtTime(0.7, now);
 
       const soleEnv = ctx.createGain();
-      const soleDur = 0.034 + Math.random() * 0.012;
+      const solePeak = Math.max(0.0005, 0.125 * inten * gainRand);
       soleEnv.gain.setValueAtTime(0.0001, now);
-      soleEnv.gain.linearRampToValueAtTime(0.115 * inten, now + 0.0022);
-      soleEnv.gain.exponentialRampToValueAtTime(0.0001, now + soleDur);
+      soleEnv.gain.linearRampToValueAtTime(solePeak, attackEnd);
+      soleEnv.gain.exponentialRampToValueAtTime(0.0001, decayEnd);
 
-      soleSrc.connect(soleFilter);
-      soleFilter.connect(soleEnv);
+      soleSrc.connect(soleHP);
+      soleHP.connect(soleLP);
+      soleLP.connect(soleEnv);
       this._connectToMix(soleEnv, pan, true);
-      soleSrc.start(now, Math.random() * 0.35);
-      soleSrc.stop(now + soleDur + 0.015);
-      return;
-    }
-
-    if (surf === 'bridge') {
-      // 1. Deeper hollow wooden bridge-span thump suspended over the stream
-      const spanOsc = ctx.createOscillator();
-      spanOsc.type = 'sine';
-      const spanBase = 114 + (Math.random() - 0.5) * 18;
-      spanOsc.frequency.setValueAtTime(spanBase, now);
-      spanOsc.frequency.exponentialRampToValueAtTime(52 + Math.random() * 8, now + 0.125);
-
-      const spanHarm = ctx.createOscillator();
-      spanHarm.type = 'triangle';
-      spanHarm.frequency.setValueAtTime(spanBase * 2.02, now);
-      spanHarm.frequency.exponentialRampToValueAtTime(spanBase * 1.08, now + 0.095);
-
-      const spanHarmGain = ctx.createGain();
-      spanHarmGain.gain.setValueAtTime(0.38, now);
-
-      const spanFilter = ctx.createBiquadFilter();
-      spanFilter.type = 'lowpass';
-      spanFilter.frequency.setValueAtTime(340 + Math.random() * 80, now);
-      spanFilter.Q.setValueAtTime(1.4, now);
-
-      const spanEnv = ctx.createGain();
-      spanEnv.gain.setValueAtTime(0.0001, now);
-      spanEnv.gain.linearRampToValueAtTime(0.28 * inten, now + 0.0055);
-      spanEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.135);
-
-      spanOsc.connect(spanFilter);
-      spanHarm.connect(spanHarmGain);
-      spanHarmGain.connect(spanFilter);
-      spanFilter.connect(spanEnv);
-      this._connectToMix(spanEnv, pan, true);
-
-      spanOsc.start(now);
-      spanHarm.start(now);
-      spanOsc.stop(now + 0.15);
-      spanHarm.stop(now + 0.12);
-
-      // 2. Heavy timber plank strike + boot sole slap
-      const plankSrc = ctx.createBufferSource();
-      plankSrc.buffer = this._pinkBuffer;
-      plankSrc.loop = true;
-
-      const plankFilter = ctx.createBiquadFilter();
-      plankFilter.type = 'bandpass';
-      plankFilter.frequency.setValueAtTime(760 + Math.random() * 220, now);
-      plankFilter.frequency.exponentialRampToValueAtTime(390 + Math.random() * 90, now + 0.062);
-      plankFilter.Q.setValueAtTime(1.65, now);
-
-      const plankEnv = ctx.createGain();
-      const plankDur = 0.062 + Math.random() * 0.022;
-      plankEnv.gain.setValueAtTime(0.0001, now);
-      plankEnv.gain.linearRampToValueAtTime(0.18 * inten, now + 0.0038);
-      plankEnv.gain.exponentialRampToValueAtTime(0.0001, now + plankDur);
-
-      plankSrc.connect(plankFilter);
-      plankFilter.connect(plankEnv);
-      this._connectToMix(plankEnv, pan, true);
-      plankSrc.start(now, Math.random() * 3.0);
-      plankSrc.stop(now + plankDur + 0.015);
-
-      // 3. Slight weathered bridge-plank creak (organic micro-groan on weight load)
-      const creakStart = now + 0.014 + Math.random() * 0.018;
-      const creakDur = 0.075 + Math.random() * 0.055;
-      const creakOsc = ctx.createOscillator();
-      creakOsc.type = 'sawtooth';
-      const cF0 = 360 + Math.random() * 170;
-      const cF1 = cF0 * (Math.random() > 0.45 ? 0.82 : 1.14);
-      creakOsc.frequency.setValueAtTime(cF0, creakStart);
-      creakOsc.frequency.exponentialRampToValueAtTime(cF1, creakStart + creakDur);
-
-      const creakFilter = ctx.createBiquadFilter();
-      creakFilter.type = 'bandpass';
-      creakFilter.frequency.setValueAtTime(cF0 * 2.2, creakStart);
-      creakFilter.Q.setValueAtTime(7.5, creakStart);
-
-      const creakEnv = ctx.createGain();
-      const creakPeak = (0.024 + Math.random() * 0.020) * inten;
-      creakEnv.gain.setValueAtTime(0.0001, creakStart);
-      creakEnv.gain.linearRampToValueAtTime(creakPeak, creakStart + creakDur * 0.28);
-      creakEnv.gain.exponentialRampToValueAtTime(0.0001, creakStart + creakDur);
-
-      creakOsc.connect(creakFilter);
-      creakFilter.connect(creakEnv);
-      this._connectToMix(creakEnv, pan, true);
-      creakOsc.start(creakStart);
-      creakOsc.stop(creakStart + creakDur + 0.015);
-      return;
-    }
-
-    if (surf === 'stone') {
-      // 1. Crisp hard-heel mineral tap click (tight high-mid transient)
-      const tapSrc = ctx.createBufferSource();
-      tapSrc.buffer = this._whiteBuffer;
-      tapSrc.loop = true;
-
-      const tapFilter = ctx.createBiquadFilter();
-      tapFilter.type = 'bandpass';
-      const tapF0 = 3050 + Math.random() * 1150;
-      tapFilter.frequency.setValueAtTime(tapF0, now);
-      tapFilter.frequency.exponentialRampToValueAtTime(1750 + Math.random() * 450, now + 0.036);
-      tapFilter.Q.setValueAtTime(2.35, now);
-
-      const tapEnv = ctx.createGain();
-      const tapDur = 0.034 + Math.random() * 0.014;
-      tapEnv.gain.setValueAtTime(0.0001, now);
-      tapEnv.gain.linearRampToValueAtTime(0.205 * inten, now + 0.0018);
-      tapEnv.gain.exponentialRampToValueAtTime(0.0001, now + tapDur);
-
-      tapSrc.connect(tapFilter);
-      tapFilter.connect(tapEnv);
-      this._connectToMix(tapEnv, pan, true);
-      tapSrc.start(now, Math.random() * 0.35);
-      tapSrc.stop(now + tapDur + 0.015);
-
-      // 2. Hard mineral stone ping formant (~1180–1580 Hz tight resonant knock)
-      const pingSrc = ctx.createBufferSource();
-      pingSrc.buffer = this._crackleBuffer;
-
-      const pingFilter = ctx.createBiquadFilter();
-      pingFilter.type = 'bandpass';
-      pingFilter.frequency.setValueAtTime(1180 + Math.random() * 420, now);
-      pingFilter.Q.setValueAtTime(5.2, now);
-
-      const pingEnv = ctx.createGain();
-      const pingDur = 0.044 + Math.random() * 0.014;
-      pingEnv.gain.setValueAtTime(0.0001, now);
-      pingEnv.gain.linearRampToValueAtTime(0.155 * inten, now + 0.002);
-      pingEnv.gain.exponentialRampToValueAtTime(0.0001, now + pingDur);
-
-      pingSrc.connect(pingFilter);
-      pingFilter.connect(pingEnv);
-      this._connectToMix(pingEnv, pan, true);
-      pingSrc.start(now, Math.random() * 0.025, pingDur + 0.01);
-      pingSrc.stop(now + pingDur + 0.015);
-
-      // 3. Dense crisp boot-heel rock impact impulse (~145 -> 68 Hz)
-      const heelOsc = ctx.createOscillator();
-      heelOsc.type = 'triangle';
-      heelOsc.frequency.setValueAtTime(144 + (Math.random() - 0.5) * 18, now);
-      heelOsc.frequency.exponentialRampToValueAtTime(66, now + 0.042);
-
-      const heelEnv = ctx.createGain();
-      heelEnv.gain.setValueAtTime(0.0001, now);
-      heelEnv.gain.linearRampToValueAtTime(0.17 * inten, now + 0.0022);
-      heelEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.052);
-
-      heelOsc.connect(heelEnv);
-      this._connectToMix(heelEnv, pan, true);
-      heelOsc.start(now);
-      heelOsc.stop(now + 0.062);
-
-      // 4. Subtle fine mineral grit micro-scuff on sole roll-off
-      const gritTime = now + 0.012 + Math.random() * 0.008;
-      const gritSrc = ctx.createBufferSource();
-      gritSrc.buffer = this._whiteBuffer;
-      gritSrc.loop = true;
-
-      const gritHP = ctx.createBiquadFilter();
-      gritHP.type = 'highpass';
-      gritHP.frequency.setValueAtTime(3200 + Math.random() * 900, gritTime);
-
-      const gritEnv = ctx.createGain();
-      gritEnv.gain.setValueAtTime(0.0001, gritTime);
-      gritEnv.gain.linearRampToValueAtTime(0.055 * inten, gritTime + 0.003);
-      gritEnv.gain.exponentialRampToValueAtTime(0.0001, gritTime + 0.026);
-
-      gritSrc.connect(gritHP);
-      gritHP.connect(gritEnv);
-      this._connectToMix(gritEnv, pan, true);
-      gritSrc.start(gritTime, Math.random() * 0.35);
-      gritSrc.stop(gritTime + 0.036);
+      soleSrc.start(now, Math.random() * 3.0);
+      soleSrc.stop(decayEnd + 0.02);
       return;
     }
 
     if (surf === 'water') {
-      // Frothy splash body (600–1350 Hz) + airy spray burst (1750–2800 Hz)
-      const bodySrc = ctx.createBufferSource();
-      bodySrc.buffer = this._pinkBuffer;
-      bodySrc.loop = true;
+      // Smooth splashy foam burst (pink LP 2200 Hz, Q = 0.65) + gentle water trickle
+      const foamSrc = ctx.createBufferSource();
+      foamSrc.buffer = this._pinkBuffer;
+      foamSrc.loop = true;
 
-      const bodyFilter = ctx.createBiquadFilter();
-      bodyFilter.type = 'bandpass';
-      bodyFilter.frequency.setValueAtTime(1150 + Math.random() * 450, now);
-      bodyFilter.frequency.exponentialRampToValueAtTime(620 + Math.random() * 180, now + 0.22);
-      bodyFilter.Q.setValueAtTime(1.15, now);
+      const foamHP = ctx.createBiquadFilter();
+      foamHP.type = 'highpass';
+      foamHP.frequency.setValueAtTime(240 * pitchRand, now);
+      foamHP.Q.setValueAtTime(0.65, now);
 
-      const bodyEnv = ctx.createGain();
-      const bodyDur = 0.18 + Math.random() * 0.07;
-      bodyEnv.gain.setValueAtTime(0.0001, now);
-      bodyEnv.gain.linearRampToValueAtTime(0.22 * inten, now + 0.016);
-      bodyEnv.gain.exponentialRampToValueAtTime(0.0001, now + bodyDur);
+      const foamLP = ctx.createBiquadFilter();
+      foamLP.type = 'lowpass';
+      foamLP.frequency.setValueAtTime(2200 * pitchRand, now);
+      foamLP.Q.setValueAtTime(0.65, now);
 
-      bodySrc.connect(bodyFilter);
-      bodyFilter.connect(bodyEnv);
-      this._connectToMix(bodyEnv, pan, true);
-      bodySrc.start(now, Math.random() * 3.0);
-      bodySrc.stop(now + bodyDur + 0.02);
+      const foamEnv = ctx.createGain();
+      const foamPeak = Math.max(0.0005, 0.21 * inten * gainRand);
+      foamEnv.gain.setValueAtTime(0.0001, now);
+      foamEnv.gain.linearRampToValueAtTime(foamPeak, attackEnd);
+      foamEnv.gain.exponentialRampToValueAtTime(0.0001, decayEnd);
 
-      // Bright sparkling water froth layer (1900–2800 Hz)
-      const frothSrc = ctx.createBufferSource();
-      frothSrc.buffer = this._whiteBuffer;
-      frothSrc.loop = true;
+      foamSrc.connect(foamHP);
+      foamHP.connect(foamLP);
+      foamLP.connect(foamEnv);
+      this._connectToMix(foamEnv, pan, true);
+      foamSrc.start(now, Math.random() * 3.0);
+      foamSrc.stop(decayEnd + 0.02);
 
-      const frothFilter = ctx.createBiquadFilter();
-      frothFilter.type = 'bandpass';
-      frothFilter.frequency.setValueAtTime(2200 + Math.random() * 600, now);
-      frothFilter.frequency.exponentialRampToValueAtTime(1300 + Math.random() * 300, now + 0.24);
-      frothFilter.Q.setValueAtTime(1.3, now);
+      // Gentle trailing water trickle wash + soft droplets
+      const trickleSrc = ctx.createBufferSource();
+      trickleSrc.buffer = this._pinkBuffer;
+      trickleSrc.loop = true;
 
-      const frothEnv = ctx.createGain();
-      const frothDur = 0.21 + Math.random() * 0.08;
-      frothEnv.gain.setValueAtTime(0.0001, now);
-      frothEnv.gain.linearRampToValueAtTime(0.14 * inten, now + 0.012);
-      frothEnv.gain.exponentialRampToValueAtTime(0.0001, now + frothDur);
+      const trickleLP = ctx.createBiquadFilter();
+      trickleLP.type = 'lowpass';
+      trickleLP.frequency.setValueAtTime(1350 * pitchRand, now + 0.02);
+      trickleLP.Q.setValueAtTime(0.65, now + 0.02);
 
-      frothSrc.connect(frothFilter);
-      frothFilter.connect(frothEnv);
-      this._connectToMix(frothEnv, pan, true);
-      frothSrc.start(now, Math.random() * 0.35);
-      frothSrc.stop(now + frothDur + 0.02);
+      const trickleEnv = ctx.createGain();
+      const tricklePeak = Math.max(0.0005, 0.085 * inten * gainRand);
+      trickleEnv.gain.setValueAtTime(0.0001, now + 0.015);
+      trickleEnv.gain.linearRampToValueAtTime(tricklePeak, now + 0.045);
+      trickleEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.19);
 
-      // Subtle submerged heel thump
-      const thud = ctx.createOscillator();
-      thud.type = 'sine';
-      thud.frequency.setValueAtTime(84 + Math.random() * 12, now);
-      thud.frequency.exponentialRampToValueAtTime(42, now + 0.065);
-      const thudEnv = ctx.createGain();
-      thudEnv.gain.setValueAtTime(0.0001, now);
-      thudEnv.gain.linearRampToValueAtTime(0.095 * inten, now + 0.006);
-      thudEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.075);
-      thud.connect(thudEnv);
-      this._connectToMix(thudEnv, pan, true);
-      thud.start(now);
-      thud.stop(now + 0.085);
+      trickleSrc.connect(trickleLP);
+      trickleLP.connect(trickleEnv);
+      this._connectToMix(trickleEnv, pan, true);
+      trickleSrc.start(now + 0.015, Math.random() * 3.0);
+      trickleSrc.stop(now + 0.21);
 
-      // Shimmering droplet scatter tail
-      const dropCount = 2 + Math.floor(Math.random() * 3);
+      const dropCount = 2 + Math.floor(Math.random() * 2);
       for (let d = 0; d < dropCount; d++) {
-        const dt = 0.055 + d * 0.048 + Math.random() * 0.035;
-        const dropFreq = 1100 + Math.random() * 1450;
-        const dropPan = clamp(pan + (Math.random() - 0.5) * 0.45, -1, 1);
-        this._scheduleDropletPing(now + dt, dropFreq, 0.028 * inten * (0.7 + Math.random() * 0.4), dropPan, true);
+        const dt = 0.055 + d * 0.048 + Math.random() * 0.03;
+        const dropFreq = 780 + Math.random() * 720;
+        const dropPan = clamp(pan + (Math.random() - 0.5) * 0.38, -1, 1);
+        this._scheduleDropletPing(now + dt, dropFreq, 0.022 * inten * gainRand, dropPan, true);
       }
       return;
     }
 
-    if (surf === 'dirt' || surf === 'rock') {
-      const isRock = surf === 'rock';
+    if (surf === 'dirt') {
+      // Warm earthy soil crunch: pink + touch of brown (HP 220 Hz -> LP 1550 Hz, Q = 0.7)
+      const pinkSrc = ctx.createBufferSource();
+      pinkSrc.buffer = this._pinkBuffer;
+      pinkSrc.loop = true;
 
-      // Crisp gritty gravel / stone crunch (1800–4200 Hz)
-      const gritSrc = ctx.createBufferSource();
-      gritSrc.buffer = this._whiteBuffer;
-      gritSrc.loop = true;
+      const brownSrc = ctx.createBufferSource();
+      brownSrc.buffer = this._brownBuffer;
+      brownSrc.loop = true;
 
-      const gritFilter = ctx.createBiquadFilter();
-      gritFilter.type = 'bandpass';
-      const startFreq = isRock ? 2800 + Math.random() * 1400 : 1900 + Math.random() * 1300;
-      const endFreq = isRock ? 1850 + Math.random() * 550 : 1250 + Math.random() * 450;
-      const gritDur = isRock ? 0.055 + Math.random() * 0.024 : 0.078 + Math.random() * 0.032;
-      gritFilter.frequency.setValueAtTime(startFreq, now);
-      gritFilter.frequency.exponentialRampToValueAtTime(endFreq, now + gritDur);
-      gritFilter.Q.setValueAtTime(isRock ? 1.65 : 1.35, now);
+      const brownMix = ctx.createGain();
+      brownMix.gain.setValueAtTime(0.38, now);
 
-      const gritEnv = ctx.createGain();
-      gritEnv.gain.setValueAtTime(0.0001, now);
-      gritEnv.gain.linearRampToValueAtTime((isRock ? 0.17 : 0.145) * inten, now + 0.005);
-      gritEnv.gain.exponentialRampToValueAtTime(0.0001, now + gritDur);
+      const soilHP = ctx.createBiquadFilter();
+      soilHP.type = 'highpass';
+      soilHP.frequency.setValueAtTime(220 * pitchRand, now);
+      soilHP.Q.setValueAtTime(0.7, now);
 
-      gritSrc.connect(gritFilter);
-      gritFilter.connect(gritEnv);
-      this._connectToMix(gritEnv, pan, true);
-      gritSrc.start(now, Math.random() * 0.35);
-      gritSrc.stop(now + gritDur + 0.015);
+      const soilLP = ctx.createBiquadFilter();
+      soilLP.type = 'lowpass';
+      soilLP.frequency.setValueAtTime(1550 * pitchRand, now);
+      soilLP.Q.setValueAtTime(0.7, now);
 
-      // Micro secondary pebble/grit scuff 18 ms later for organic gravel crunch
-      const scuffTime = now + 0.016 + Math.random() * 0.012;
-      const scuffSrc = ctx.createBufferSource();
-      scuffSrc.buffer = this._whiteBuffer;
-      scuffSrc.loop = true;
-      const scuffFilter = ctx.createBiquadFilter();
-      scuffFilter.type = 'bandpass';
-      scuffFilter.frequency.setValueAtTime(2400 + Math.random() * 1600, scuffTime);
-      scuffFilter.Q.setValueAtTime(2.0, scuffTime);
-      const scuffEnv = ctx.createGain();
-      scuffEnv.gain.setValueAtTime(0.0001, scuffTime);
-      scuffEnv.gain.linearRampToValueAtTime(0.08 * inten, scuffTime + 0.004);
-      scuffEnv.gain.exponentialRampToValueAtTime(0.0001, scuffTime + 0.042);
-      scuffSrc.connect(scuffFilter);
-      scuffFilter.connect(scuffEnv);
-      this._connectToMix(scuffEnv, pan, true);
-      scuffSrc.start(scuffTime, Math.random() * 0.35);
-      scuffSrc.stop(scuffTime + 0.05);
+      const soilEnv = ctx.createGain();
+      const soilPeak = Math.max(0.0005, 0.155 * inten * gainRand);
+      soilEnv.gain.setValueAtTime(0.0001, now);
+      soilEnv.gain.linearRampToValueAtTime(soilPeak, attackEnd);
+      soilEnv.gain.exponentialRampToValueAtTime(0.0001, decayEnd);
 
-      // Punchy footfall thump (~110 Hz)
-      const thump = ctx.createOscillator();
-      thump.type = isRock ? 'triangle' : 'sine';
-      const thumpStart = (isRock ? 118 : 108) + (Math.random() - 0.5) * 14;
-      thump.frequency.setValueAtTime(thumpStart, now);
-      thump.frequency.exponentialRampToValueAtTime(52, now + 0.062);
+      pinkSrc.connect(soilHP);
+      brownSrc.connect(brownMix);
+      brownMix.connect(soilHP);
+      soilHP.connect(soilLP);
+      soilLP.connect(soilEnv);
+      this._connectToMix(soilEnv, pan, true);
 
-      const thumpEnv = ctx.createGain();
-      thumpEnv.gain.setValueAtTime(0.0001, now);
-      thumpEnv.gain.linearRampToValueAtTime((isRock ? 0.175 : 0.155) * inten, now + 0.0035);
-      thumpEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.072);
-
-      thump.connect(thumpEnv);
-      this._connectToMix(thumpEnv, pan, true);
-      thump.start(now);
-      thump.stop(now + 0.082);
+      pinkSrc.start(now, Math.random() * 3.0);
+      brownSrc.start(now, Math.random() * 3.0);
+      pinkSrc.stop(decayEnd + 0.02);
+      brownSrc.stop(decayEnd + 0.02);
       return;
     }
 
-    // Default: 'grass' — soft filtered rustle burst (900–2400 Hz) + muted low heel thud (~95 Hz)
-    const rustleSrc = ctx.createBufferSource();
-    rustleSrc.buffer = this._pinkBuffer;
-    rustleSrc.loop = true;
+    if (surf === 'stone' || surf === 'rock') {
+      // Natural dry grit scuff: pink (HP 340 Hz -> LP 1950 Hz, Q = 0.7)
+      const gritSrc = ctx.createBufferSource();
+      gritSrc.buffer = this._pinkBuffer;
+      gritSrc.loop = true;
 
-    const rustleFilter = ctx.createBiquadFilter();
-    rustleFilter.type = 'bandpass';
-    const rStart = 1550 + Math.random() * 850; // up to ~2400 Hz
-    const rEnd = 900 + Math.random() * 350;
-    const rustleDur = 0.095 + Math.random() * 0.038;
-    rustleFilter.frequency.setValueAtTime(rStart, now);
-    rustleFilter.frequency.exponentialRampToValueAtTime(rEnd, now + rustleDur);
-    rustleFilter.Q.setValueAtTime(1.15, now);
+      const gritHP = ctx.createBiquadFilter();
+      gritHP.type = 'highpass';
+      gritHP.frequency.setValueAtTime(340 * pitchRand, now);
+      gritHP.Q.setValueAtTime(0.7, now);
 
-    const rustleEnv = ctx.createGain();
-    rustleEnv.gain.setValueAtTime(0.0001, now);
-    rustleEnv.gain.linearRampToValueAtTime(0.135 * inten, now + 0.014);
-    rustleEnv.gain.exponentialRampToValueAtTime(0.0001, now + rustleDur);
+      const gritLP = ctx.createBiquadFilter();
+      gritLP.type = 'lowpass';
+      gritLP.frequency.setValueAtTime(1950 * pitchRand, now);
+      gritLP.Q.setValueAtTime(0.7, now);
 
-    rustleSrc.connect(rustleFilter);
-    rustleFilter.connect(rustleEnv);
-    this._connectToMix(rustleEnv, pan, true);
-    rustleSrc.start(now, Math.random() * 3.0);
-    rustleSrc.stop(now + rustleDur + 0.02);
+      const gritEnv = ctx.createGain();
+      const gritPeak = Math.max(0.0005, 0.16 * inten * gainRand);
+      gritEnv.gain.setValueAtTime(0.0001, now);
+      gritEnv.gain.linearRampToValueAtTime(gritPeak, attackEnd);
+      gritEnv.gain.exponentialRampToValueAtTime(0.0001, decayEnd);
 
-    // Muted low heel thud (~95 Hz)
-    const heelOsc = ctx.createOscillator();
-    heelOsc.type = 'sine';
-    heelOsc.frequency.setValueAtTime(95 + (Math.random() - 0.5) * 12, now);
-    heelOsc.frequency.exponentialRampToValueAtTime(46, now + 0.068);
+      gritSrc.connect(gritHP);
+      gritHP.connect(gritLP);
+      gritLP.connect(gritEnv);
+      this._connectToMix(gritEnv, pan, true);
+      gritSrc.start(now, Math.random() * 3.0);
+      gritSrc.stop(decayEnd + 0.02);
+      return;
+    }
 
-    const heelEnv = ctx.createGain();
-    heelEnv.gain.setValueAtTime(0.0001, now);
-    heelEnv.gain.linearRampToValueAtTime(0.115 * inten, now + 0.006);
-    heelEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.078);
+    // Default: 'grass' / 'moss' — soft organic leaf/blade swish (HP 280 Hz -> LP 1350 Hz, Q = 0.7)
+    const grassSrc = ctx.createBufferSource();
+    grassSrc.buffer = this._pinkBuffer;
+    grassSrc.loop = true;
 
-    heelOsc.connect(heelEnv);
-    this._connectToMix(heelEnv, pan, true);
-    heelOsc.start(now);
-    heelOsc.stop(now + 0.09);
+    const grassHP = ctx.createBiquadFilter();
+    grassHP.type = 'highpass';
+    grassHP.frequency.setValueAtTime(280 * pitchRand, now);
+    grassHP.Q.setValueAtTime(0.7, now);
+
+    const grassLP = ctx.createBiquadFilter();
+    grassLP.type = 'lowpass';
+    grassLP.frequency.setValueAtTime(1350 * pitchRand, now);
+    grassLP.Q.setValueAtTime(0.7, now);
+
+    const grassEnv = ctx.createGain();
+    const grassPeak = Math.max(0.0005, 0.14 * inten * gainRand);
+    grassEnv.gain.setValueAtTime(0.0001, now);
+    grassEnv.gain.linearRampToValueAtTime(grassPeak, attackEnd);
+    grassEnv.gain.exponentialRampToValueAtTime(0.0001, decayEnd);
+
+    grassSrc.connect(grassHP);
+    grassHP.connect(grassLP);
+    grassLP.connect(grassEnv);
+    this._connectToMix(grassEnv, pan, true);
+    grassSrc.start(now, Math.random() * 3.0);
+    grassSrc.stop(decayEnd + 0.02);
   }
 
   /**
@@ -1913,6 +1777,265 @@ export class ProceduralAudio {
       const pan = (Math.random() - 0.5) * 0.9;
       this._scheduleDropletPing(t, freq, 0.032 + Math.random() * 0.018, pan);
     }
+  }
+
+  /**
+   * Plays a warm muffled rushing water arm-sweep + low splash displacement push.
+   */
+  playSwimStroke(isSprint = false) {
+    if (!this._canPlayOneShots()) return;
+
+    const ctx = this._ctx;
+    const now = ctx.currentTime;
+    const sprint = Boolean(isSprint);
+    const pitchRand = 0.92 + Math.random() * 0.16;
+
+    this._footstepSide = -this._footstepSide;
+    const pan = this._footstepSide * 0.22 + (Math.random() - 0.5) * 0.08;
+    const sweepDur = sprint ? 0.28 : 0.4;
+
+    // 1. Warm muffled rushing water arm-sweep (broad LP/HP pink noise, Q <= 0.72)
+    const sweepSrc = ctx.createBufferSource();
+    sweepSrc.buffer = this._pinkBuffer;
+    sweepSrc.loop = true;
+
+    const sweepHP = ctx.createBiquadFilter();
+    sweepHP.type = 'highpass';
+    sweepHP.frequency.setValueAtTime(150 * pitchRand, now);
+    sweepHP.Q.setValueAtTime(0.7, now);
+
+    const sweepLP = ctx.createBiquadFilter();
+    sweepLP.type = 'lowpass';
+    sweepLP.frequency.setValueAtTime((sprint ? 480 : 360) * pitchRand, now);
+    sweepLP.frequency.exponentialRampToValueAtTime((sprint ? 1420 : 920) * pitchRand, now + sweepDur * 0.32);
+    sweepLP.frequency.exponentialRampToValueAtTime(280 * pitchRand, now + sweepDur);
+    sweepLP.Q.setValueAtTime(0.7, now);
+
+    const sweepEnv = ctx.createGain();
+    const sweepPeak = sprint ? 0.24 : 0.17;
+    sweepEnv.gain.setValueAtTime(0.0001, now);
+    sweepEnv.gain.linearRampToValueAtTime(sweepPeak, now + (sprint ? 0.042 : 0.07));
+    sweepEnv.gain.exponentialRampToValueAtTime(0.0001, now + sweepDur);
+
+    sweepSrc.connect(sweepHP);
+    sweepHP.connect(sweepLP);
+    sweepLP.connect(sweepEnv);
+    this._connectToMix(sweepEnv, pan, false);
+    sweepSrc.start(now, Math.random() * 3.0);
+    sweepSrc.stop(now + sweepDur + 0.03);
+
+    // 2. Low water displacement splash push (brown noise + warm low sine push)
+    const pushSrc = ctx.createBufferSource();
+    pushSrc.buffer = this._brownBuffer;
+    pushSrc.loop = true;
+
+    const pushLP = ctx.createBiquadFilter();
+    pushLP.type = 'lowpass';
+    pushLP.frequency.setValueAtTime((sprint ? 420 : 320) * pitchRand, now);
+    pushLP.Q.setValueAtTime(0.7, now);
+
+    const pushEnv = ctx.createGain();
+    const pushDur = sprint ? 0.22 : 0.3;
+    pushEnv.gain.setValueAtTime(0.0001, now);
+    pushEnv.gain.linearRampToValueAtTime(sprint ? 0.24 : 0.18, now + 0.035);
+    pushEnv.gain.exponentialRampToValueAtTime(0.0001, now + pushDur);
+
+    pushSrc.connect(pushLP);
+    pushLP.connect(pushEnv);
+    this._connectToMix(pushEnv, pan * 0.7, false);
+    pushSrc.start(now, Math.random() * 3.0);
+    pushSrc.stop(now + pushDur + 0.03);
+
+    const pushOsc = ctx.createOscillator();
+    pushOsc.type = 'sine';
+    pushOsc.frequency.setValueAtTime(92 * pitchRand, now);
+    pushOsc.frequency.exponentialRampToValueAtTime(42 * pitchRand, now + 0.11);
+
+    const oscLP = ctx.createBiquadFilter();
+    oscLP.type = 'lowpass';
+    oscLP.frequency.setValueAtTime(175, now);
+    oscLP.Q.setValueAtTime(0.7, now);
+
+    const oscEnv = ctx.createGain();
+    oscEnv.gain.setValueAtTime(0.0001, now);
+    oscEnv.gain.linearRampToValueAtTime(sprint ? 0.14 : 0.1, now + 0.014);
+    oscEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+
+    pushOsc.connect(oscLP);
+    oscLP.connect(oscEnv);
+    this._connectToMix(oscEnv, pan * 0.5, false);
+    pushOsc.start(now);
+    pushOsc.stop(now + 0.14);
+
+    // 3. Soft surface foam droplets on surface strokes
+    if (!this._isUnderwater) {
+      const dropCount = sprint ? 3 : 2;
+      for (let d = 0; d < dropCount; d++) {
+        const dt = 0.06 + d * 0.055 + Math.random() * 0.03;
+        const dropFreq = 720 + Math.random() * 880;
+        this._scheduleDropletPing(now + dt, dropFreq, (sprint ? 0.024 : 0.016), clamp(pan + (Math.random() - 0.5) * 0.35, -1, 1), false);
+      }
+    }
+  }
+
+  /**
+   * Plays organic rising pitch-swept underwater sine bubbles (260 -> 620 Hz).
+   */
+  playBubbleBurst(count = 3) {
+    if (!this._canPlayOneShots()) return;
+
+    const ctx = this._ctx;
+    const now = ctx.currentTime;
+    const n = clamp(Math.round(Number.isFinite(count) ? count : 3), 1, 12);
+
+    let offset = 0;
+    for (let i = 0; i < n; i++) {
+      const t = now + offset;
+      const dur = 0.055 + Math.random() * 0.048;
+      const f0 = 260 + Math.random() * 115; // 260..375 Hz start
+      const f1 = clamp(f0 * (1.72 + Math.random() * 0.55), 440, 620); // sweeps up toward 620 Hz
+      const pan = (Math.random() - 0.5) * 0.65;
+
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(f0, t);
+      osc.frequency.exponentialRampToValueAtTime(f1, t + dur);
+
+      const env = ctx.createGain();
+      const peak = 0.075 + Math.random() * 0.035;
+      env.gain.setValueAtTime(0.0001, t);
+      env.gain.linearRampToValueAtTime(peak, t + 0.012);
+      env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+      osc.connect(env);
+      this._connectToMix(env, pan, false);
+      osc.start(t);
+      osc.stop(t + dur + 0.015);
+
+      offset += 0.045 + Math.random() * 0.06;
+    }
+  }
+
+  /**
+   * Plays a magical shimmering warm harmonic arpeggio chime
+   * (4-note pentatonic crystalline bell chord).
+   */
+  playRelicFound() {
+    if (!this._canPlayOneShots()) return;
+
+    const ctx = this._ctx;
+    const now = ctx.currentTime;
+    // Ascending C-major pentatonic crystalline bell chord (C5, E5, G5, C6)
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+
+    for (let i = 0; i < notes.length; i++) {
+      const t = now + i * 0.088;
+      const freq = notes[i];
+      const dur = 0.95 + i * 0.14;
+      const pan = -0.3 + i * 0.2;
+
+      // Warm bell fundamental
+      const fundOsc = ctx.createOscillator();
+      fundOsc.type = 'sine';
+      fundOsc.frequency.setValueAtTime(freq, t);
+
+      const fundEnv = ctx.createGain();
+      fundEnv.gain.setValueAtTime(0.0001, t);
+      fundEnv.gain.linearRampToValueAtTime(0.135, t + 0.01);
+      fundEnv.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+      fundOsc.connect(fundEnv);
+      this._connectToMix(fundEnv, pan, true);
+      fundOsc.start(t);
+      fundOsc.stop(t + dur + 0.03);
+
+      // Shimmering slightly-detuned crystalline octave overtone
+      const shimOsc = ctx.createOscillator();
+      shimOsc.type = 'sine';
+      shimOsc.frequency.setValueAtTime(freq * 2.003, t);
+
+      const shimEnv = ctx.createGain();
+      shimEnv.gain.setValueAtTime(0.0001, t);
+      shimEnv.gain.linearRampToValueAtTime(0.048, t + 0.008);
+      shimEnv.gain.exponentialRampToValueAtTime(0.0001, t + dur * 0.68);
+
+      shimOsc.connect(shimEnv);
+      this._connectToMix(shimEnv, -pan * 0.6, true);
+      shimOsc.start(t);
+      shimOsc.stop(t + dur * 0.72 + 0.02);
+    }
+  }
+
+  /**
+   * Plays a quick crisp golden sparkle chord shimmer when swapping characters.
+   */
+  playCharacterSwap() {
+    if (!this._canPlayOneShots()) return;
+
+    const ctx = this._ctx;
+    const now = ctx.currentTime;
+    // Quick golden ascending open-fifth sparkle chord (D5, A5, D6)
+    const chord = [587.33, 880.0, 1174.66];
+
+    for (let i = 0; i < chord.length; i++) {
+      const t = now + i * 0.028;
+      const freq = chord[i];
+      const dur = 0.28 + i * 0.05;
+      const pan = (i - 1) * 0.25;
+
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t);
+
+      const harmOsc = ctx.createOscillator();
+      harmOsc.type = 'sine';
+      harmOsc.frequency.setValueAtTime(freq * 2.0, t);
+
+      const harmGain = ctx.createGain();
+      harmGain.gain.setValueAtTime(0.32, t);
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, t);
+      env.gain.linearRampToValueAtTime(0.11, t + 0.006);
+      env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+      osc.connect(env);
+      harmOsc.connect(harmGain);
+      harmGain.connect(env);
+      this._connectToMix(env, pan, false);
+
+      osc.start(t);
+      harmOsc.start(t);
+      osc.stop(t + dur + 0.02);
+      harmOsc.stop(t + dur + 0.02);
+    }
+
+    // Subtle crisp airy sparkle shimmer breeze
+    const airSrc = ctx.createBufferSource();
+    airSrc.buffer = this._pinkBuffer;
+    airSrc.loop = true;
+
+    const airHP = ctx.createBiquadFilter();
+    airHP.type = 'highpass';
+    airHP.frequency.setValueAtTime(2200, now);
+    airHP.Q.setValueAtTime(0.7, now);
+
+    const airLP = ctx.createBiquadFilter();
+    airLP.type = 'lowpass';
+    airLP.frequency.setValueAtTime(6400, now);
+    airLP.Q.setValueAtTime(0.7, now);
+
+    const airEnv = ctx.createGain();
+    airEnv.gain.setValueAtTime(0.0001, now);
+    airEnv.gain.linearRampToValueAtTime(0.055, now + 0.025);
+    airEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+
+    airSrc.connect(airHP);
+    airHP.connect(airLP);
+    airLP.connect(airEnv);
+    this._connectToMix(airEnv, 0.0, false);
+    airSrc.start(now, Math.random() * 3.0);
+    airSrc.stop(now + 0.22);
   }
 
   dispose() {
