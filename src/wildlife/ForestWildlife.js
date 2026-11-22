@@ -1915,6 +1915,13 @@ export class ForestWildlife {
    * it into grass ~4.2 units ahead/beside the human so a visible grass sprint and leg-climb
    * occurs within ~0.7-1.1s!
    */
+  setSurfaceSolver(surfaceSolver) {
+    this.surfaceSolver = surfaceSolver || null;
+    for (let i = 0; i < this.rats.length; i++) {
+      this.rats[i].setSurfaceSolver?.(this.surfaceSolver);
+    }
+  }
+
   triggerRatScare(humanController) {
     const hPos = this._extractHumanPosition(humanController, _humanPos);
     if (!hPos) return false;
@@ -1960,9 +1967,12 @@ export class ForestWildlife {
     }
     this._nextManualSide = side === 'right' ? 'left' : 'right';
 
+    const shelter = this.surfaceSolver?.getShelterState?.(hPos);
+    const isIndoors = Boolean(shelter?.sheltered);
+
     let teleportNearPos = null;
-    if (bestDistSq > 49.0) {
-      // Reposition into grass ~4.2 units ahead/beside the human for immediate cinematic payoff
+    if (bestDistSq > 49.0 || (isIndoors && bestDistSq > 9.0)) {
+      // Reposition onto same walkable floor (cabin floorboards / hollow tree / grass)
       const fwd = this._extractHumanForward(humanController, _humanFwd);
       const baseYaw = Math.atan2(fwd.x, fwd.z);
       const sideSign = side === 'left' ? 1 : -1;
@@ -1977,14 +1987,16 @@ export class ForestWildlife {
         Math.PI,
       ];
 
-      const launchDist = 4.2;
+      const launchDist = isIndoors ? 1.85 : 4.2;
       let chosen = false;
       for (const offset of candidateOffsets) {
         const ang = baseYaw + offset;
         const sx = clamp(hPos.x + Math.sin(ang) * launchDist, -MAP_BOUND, MAP_BOUND);
         const sz = clamp(hPos.z + Math.cos(ang) * launchDist, -MAP_BOUND, MAP_BOUND);
-        const sy = this._sampleHeight(sx, sz);
-        if (sy > WATER_SAFE_Y) {
+        const sy = this.surfaceSolver
+          ? this.surfaceSolver.getHeightAt(sx, sz, hPos.y + 0.5)
+          : this._sampleHeight(sx, sz);
+        if (sy > WATER_SAFE_Y && (!isIndoors || Math.abs(sy - hPos.y) < 0.45)) {
           _spawnPos.set(sx, sy, sz);
           chosen = true;
           break;
@@ -1993,7 +2005,10 @@ export class ForestWildlife {
       if (!chosen) {
         const sx = clamp(hPos.x + fwd.x * launchDist, -MAP_BOUND, MAP_BOUND);
         const sz = clamp(hPos.z + fwd.z * launchDist, -MAP_BOUND, MAP_BOUND);
-        _spawnPos.set(sx, Math.max(this._sampleHeight(sx, sz), WATER_SAFE_Y), sz);
+        const sy = this.surfaceSolver
+          ? this.surfaceSolver.getHeightAt(sx, sz, hPos.y + 0.5)
+          : Math.max(this._sampleHeight(sx, sz), WATER_SAFE_Y);
+        _spawnPos.set(sx, sy, sz);
       }
       teleportNearPos = _spawnPos;
     }

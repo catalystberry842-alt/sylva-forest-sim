@@ -14,6 +14,10 @@ const QUALITY_COUNTS = {
     logs: 26,
     stumps: 30,
     mushrooms: 140,
+    twigs: 260,
+    pebbles: 360,
+    clovers: 290,
+    pineNeedles: 290,
   },
   High: {
     grass: 38000,
@@ -23,6 +27,10 @@ const QUALITY_COUNTS = {
     logs: 35,
     stumps: 40,
     mushrooms: 195,
+    twigs: 390,
+    pebbles: 530,
+    clovers: 420,
+    pineNeedles: 420,
   },
   Ultra: {
     grass: 52000,
@@ -32,6 +40,10 @@ const QUALITY_COUNTS = {
     logs: 42,
     stumps: 48,
     mushrooms: 240,
+    twigs: 480,
+    pebbles: 650,
+    clovers: 520,
+    pineNeedles: 520,
   },
 };
 
@@ -238,11 +250,12 @@ function buildNormalMapFromHeight(heightBuf, size, strength = 2.6) {
  *  - 240 bioluminescent cyan & amber mushroom clusters blooming ethereally at night
  */
 export class Undergrowth {
-  constructor(scene, terrain, windSystem, treePositions = []) {
+  constructor(scene, terrain, windSystem, treePositions = [], exclusionZones = []) {
     this.scene = scene;
     this.terrain = terrain;
     this.windSystem = windSystem;
     this.treePositions = treePositions || [];
+    this.exclusionZones = Array.isArray(exclusionZones) ? exclusionZones : [];
 
     this.group = new THREE.Group();
     this.group.name = 'ForestUndergrowth';
@@ -266,7 +279,7 @@ export class Undergrowth {
     this.colliders = [];
     this._currentQuality = 'High';
 
-    // Build all layers in ecological order so smaller floor flora can nestle around boulders & logs!
+    // Build all layers in ecological order so smaller floor flora & micro-details nestle organically!
     this.boulderMesh = this._buildBoulders();
     this.logMesh = this._buildNurseLogs();
     this.stumpMesh = this._buildTreeStumps();
@@ -275,6 +288,12 @@ export class Undergrowth {
     this.wildflowerMesh = this._buildWildflowers();
     this.mushroomMesh = this._buildBioluminescentMushrooms();
 
+    // 4 rich forest-floor micro-detail scatter layers
+    this.twigMesh = this._buildFallenTwigs();
+    this.pebbleMesh = this._buildMossyPebbles();
+    this.cloverMesh = this._buildCloverPatches();
+    this.pineNeedleMesh = this._buildPineNeedleClusters();
+
     this.group.add(
       this.boulderMesh,
       this.logMesh,
@@ -282,10 +301,27 @@ export class Undergrowth {
       this.grassMesh,
       this.fernMesh,
       this.wildflowerMesh,
-      this.mushroomMesh
+      this.mushroomMesh,
+      this.twigMesh,
+      this.pebbleMesh,
+      this.cloverMesh,
+      this.pineNeedleMesh
     );
 
     this.setQuality('High');
+  }
+
+  _isInExclusionZone(x, z, pad = 0.0) {
+    for (let i = 0; i < this.exclusionZones.length; i++) {
+      const zone = this.exclusionZones[i];
+      if (!zone) continue;
+      const r = (zone.radius ?? 0) + pad;
+      if (r <= 0) continue;
+      const dx = x - zone.x;
+      const dz = z - zone.z;
+      if (dx * dx + dz * dz < r * r) return true;
+    }
+    return false;
   }
 
   _isNearTree(x, z, pad = 0.0) {
@@ -480,6 +516,7 @@ export class Undergrowth {
         }
 
         if (Math.abs(cx) > 105 || Math.abs(cz) > 105) continue;
+        if (this._isInExclusionZone(cx, cz, 0.25)) continue;
 
         const distClear = this.terrain.getClearingDistance(cx, cz);
         if (distClear < 2.7) continue;
@@ -511,6 +548,7 @@ export class Undergrowth {
           const bx = cx + Math.cos(ba) * bd;
           const bz = cz + Math.sin(ba) * bd;
 
+          if (this._isInExclusionZone(bx, bz, 0.15)) continue;
           if (this.terrain.getClearingDistance(bx, bz) < 2.7) continue;
           const by = this.terrain.getHeightAt(bx, bz);
           if (by < 0.22) continue;
@@ -805,6 +843,7 @@ export class Undergrowth {
 
     const tryAddFern = (x, z, scaleMin = 0.68, scaleMax = 1.32) => {
       if (Math.abs(x) > 104 || Math.abs(z) > 104) return false;
+      if (this._isInExclusionZone(x, z, 0.5)) return false;
       if (this.terrain.getClearingDistance(x, z) < 4.4) return false;
       const y = this.terrain.getHeightAt(x, z);
       if (y < 0.32) return false;
@@ -1100,6 +1139,7 @@ export class Undergrowth {
       }
 
       if (Math.abs(cx) > 96 || Math.abs(cz) > 96) continue;
+      if (this._isInExclusionZone(cx, cz, 0.35)) continue;
       if (this.terrain.getClearingDistance(cx, cz) < 3.4) continue;
       const cy = this.terrain.getHeightAt(cx, cz);
       if (cy < 0.35) continue;
@@ -1115,6 +1155,7 @@ export class Undergrowth {
         const dr = d === 0 ? 0 : 0.45 + rng() * 1.45;
         const fx = cx + Math.cos(da) * dr;
         const fz = cz + Math.sin(da) * dr;
+        if (this._isInExclusionZone(fx, fz, 0.25)) continue;
         if (this.terrain.getClearingDistance(fx, fz) < 3.2) continue;
         const fy = this.terrain.getHeightAt(fx, fz);
         if (fy < 0.32 || this.terrain.getSlopeAt(fx, fz) > 0.34) continue;
@@ -1411,6 +1452,7 @@ export class Undergrowth {
       const sz = scaleBase * (0.85 + rng() * 0.35);
       const colliderRadius = Math.max(sx, sz) * 0.92;
 
+      if (this._isInExclusionZone(x, z, colliderRadius + 0.4)) continue;
       if (this._isNearTree(x, z, colliderRadius + 0.55)) continue;
 
       // Avoid heavy overlap with existing boulders (allow occasional nestled rock clusters)
@@ -1620,6 +1662,7 @@ export class Undergrowth {
       const slope = this.terrain.getSlopeAt(x, z);
       if (slope > 0.26) continue;
 
+      if (this._isInExclusionZone(x, z, 2.8)) continue;
       if (this._isNearTree(x, z, 2.6) || this._isNearBoulder(x, z, 2.4)) continue;
 
       // Avoid stacking nurse logs on top of each other
@@ -1643,8 +1686,13 @@ export class Undergrowth {
       // Sample terrain at both ends to ensure log rests cleanly without dangling off a cliff
       const dirX = Math.sin(yaw);
       const dirZ = Math.cos(yaw);
-      const yA = this.terrain.getHeightAt(x - dirX * fullLen * 0.42, z - dirZ * fullLen * 0.42);
-      const yB = this.terrain.getHeightAt(x + dirX * fullLen * 0.42, z + dirZ * fullLen * 0.42);
+      const endAx = x - dirX * fullLen * 0.42;
+      const endAz = z - dirZ * fullLen * 0.42;
+      const endBx = x + dirX * fullLen * 0.42;
+      const endBz = z + dirZ * fullLen * 0.42;
+      if (this._isInExclusionZone(endAx, endAz, 0.8) || this._isInExclusionZone(endBx, endBz, 0.8)) continue;
+      const yA = this.terrain.getHeightAt(endAx, endAz);
+      const yB = this.terrain.getHeightAt(endBx, endBz);
       if (Math.min(yA, yB) < 0.35 || Math.abs(yA - yB) > 1.35) continue;
 
       records.push({
@@ -1912,6 +1960,7 @@ export class Undergrowth {
       }
 
       if (Math.abs(x) > 100 || Math.abs(z) > 100) continue;
+      if (this._isInExclusionZone(x, z, 0.9)) continue;
       if (this.terrain.getClearingDistance(x, z) < 6.8) continue;
 
       const y = this.terrain.getHeightAt(x, z);
@@ -2128,6 +2177,7 @@ export class Undergrowth {
 
     const tryAddMushroom = (x, z, scaleMin = 0.82, scaleMax = 1.55) => {
       if (Math.abs(x) > 100 || Math.abs(z) > 100) return false;
+      if (this._isInExclusionZone(x, z, 0.35)) return false;
       if (this.terrain.getClearingDistance(x, z) < 4.5) return false;
       const y = this.terrain.getHeightAt(x, z);
       if (y < 0.26) return false;
@@ -2226,6 +2276,559 @@ export class Undergrowth {
   }
 
   // =========================================================================
+  // 7. FOREST-FLOOR MICRO-DETAIL SCATTER LAYERS (Twigs, Pebbles, Clovers, Pine Needles)
+  // =========================================================================
+
+  _applySimpleWetnessShader(material, cacheKey, darken = 0.68, wetRoughness = 0.28) {
+    const sharedUniforms = this._sharedUniforms;
+    material.customProgramCacheKey = () => cacheKey;
+    material.onBeforeCompile = (shader) => {
+      shader.uniforms.uWetness = sharedUniforms.uWetness;
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <common>',
+        `#include <common>
+        uniform float uWetness;`
+      );
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+        diffuseColor.rgb *= mix( 1.0, ${darken.toFixed(2)}, uWetness * 0.85 );`
+      );
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+        roughnessFactor = mix( roughnessFactor, ${wetRoughness.toFixed(2)}, uWetness * 0.8 );`
+      );
+    };
+  }
+
+  // 7A. Scattered Fallen Twigs & Small Branches (~480)
+  _buildFallenTwigs() {
+    const rng = createRng(8801);
+    const parts = [];
+
+    // Main gently bent woody twig lying along local Z
+    const mainCurve = new THREE.QuadraticBezierCurve3(
+      new THREE.Vector3(-0.04, 0.018, -0.34),
+      new THREE.Vector3(0.035, 0.024, 0.0),
+      new THREE.Vector3(-0.02, 0.015, 0.32)
+    );
+    parts.push(normalizeGeometry(new THREE.TubeGeometry(mainCurve, 5, 0.015, 5, false)));
+
+    // Forked side shoot 1
+    const fork1 = new THREE.QuadraticBezierCurve3(
+      new THREE.Vector3(0.02, 0.022, -0.04),
+      new THREE.Vector3(0.11, 0.028, 0.08),
+      new THREE.Vector3(0.19, 0.018, 0.20)
+    );
+    parts.push(normalizeGeometry(new THREE.TubeGeometry(fork1, 4, 0.009, 4, false)));
+
+    // Smaller opposite twig spur 2
+    const fork2 = new THREE.QuadraticBezierCurve3(
+      new THREE.Vector3(-0.005, 0.020, -0.14),
+      new THREE.Vector3(-0.085, 0.025, -0.22),
+      new THREE.Vector3(-0.15, 0.016, -0.28)
+    );
+    parts.push(normalizeGeometry(new THREE.TubeGeometry(fork2, 3, 0.0075, 4, false)));
+
+    const geo = safeMergeParts(parts, 'FallenTwigCluster');
+    this._geometries.push(geo);
+
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.92,
+      metalness: 0.0,
+    });
+    this._applySimpleWetnessShader(mat, 'fallenTwigsWet_v1', 0.62, 0.30);
+    this._materials.push(mat);
+
+    const maxCount = MAX_COUNTS.twigs;
+    const placements = [];
+    const clearingC = this.terrain.clearingCenter;
+
+    let tries = 0;
+    while (placements.length < maxCount && tries < 6000) {
+      tries++;
+      let x;
+      let z;
+      const roll = rng();
+      if (roll < 0.45 && this.treePositions.length > 0) {
+        const t = this.treePositions[Math.floor(rng() * this.treePositions.length)];
+        const a = rng() * Math.PI * 2;
+        const d = t.radius + 0.65 + rng() * 4.4;
+        x = t.x + Math.cos(a) * d;
+        z = t.z + Math.sin(a) * d;
+      } else if (roll < 0.68) {
+        const a = rng() * Math.PI * 2;
+        const d = 4.2 + rng() * 20.0;
+        x = clearingC.x + Math.cos(a) * d;
+        z = clearingC.y + Math.sin(a) * d;
+      } else {
+        x = (rng() * 2 - 1) * 92;
+        z = (rng() * 2 - 1) * 92;
+      }
+
+      if (Math.abs(x) > 98 || Math.abs(z) > 98) continue;
+      if (this._isInExclusionZone(x, z, 0.4)) continue;
+      if (this.terrain.getClearingDistance(x, z) < 2.6) continue;
+      const y = this.terrain.getHeightAt(x, z);
+      if (y < 0.22) continue;
+      if (this.terrain.getSlopeAt(x, z) > 0.36) continue;
+      if (this._isNearBoulder(x, z, 0.1)) continue;
+
+      placements.push({
+        x,
+        y,
+        z,
+        yaw: rng() * Math.PI * 2,
+        scale: 0.58 + rng() * 0.88,
+      });
+    }
+
+    shuffleDeterministic(placements, rng);
+
+    const mesh = new THREE.InstancedMesh(geo, mat, maxCount);
+    mesh.name = 'ForestFallenTwigs';
+    mesh.castShadow = false;
+    mesh.receiveShadow = true;
+    mesh.frustumCulled = false;
+
+    const palette = [
+      new THREE.Color('#5a422e'), // weathered cedar brown
+      new THREE.Color('#473527'), // damp forest bark
+      new THREE.Color('#6b5a49'), // dry silvered twig
+      new THREE.Color('#3c2d21'), // dark oak branch
+    ];
+    const dummy = new THREE.Object3D();
+    const tNorm = new THREE.Vector3();
+    const qSlope = new THREE.Quaternion();
+    const qYaw = new THREE.Quaternion();
+    const col = new THREE.Color();
+    const count = Math.min(placements.length, maxCount);
+
+    for (let i = 0; i < count; i++) {
+      const p = placements[i];
+      this.terrain.getNormalAt(p.x, p.z, tNorm);
+      qSlope.setFromUnitVectors(UP, tNorm);
+      qYaw.setFromAxisAngle(UP, p.yaw);
+
+      dummy.position.set(p.x, p.y - 0.004, p.z);
+      dummy.quaternion.copy(qSlope).multiply(qYaw);
+      dummy.scale.set(p.scale, p.scale * (0.85 + rng() * 0.3), p.scale * (0.88 + rng() * 0.35));
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+
+      col.copy(palette[Math.floor(rng() * palette.length)]).multiplyScalar(0.84 + rng() * 0.32);
+      mesh.setColorAt(i, col);
+    }
+
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    this._twigsMaxPlaced = count;
+    return mesh;
+  }
+
+  // 7B. Small Mossy Forest Pebbles (~650)
+  _buildMossyPebbles() {
+    const rng = createRng(8821);
+    const n3 = createNoise3D(createRng(8822));
+    const parts = [];
+
+    const pebbleSpecs = [
+      { ox: 0.0, oz: 0.0, rx: 0.095, ry: 0.052, rz: 0.078, seed: 1.1 },
+      { ox: 0.115, oz: 0.048, rx: 0.058, ry: 0.036, rz: 0.050, seed: 3.7 },
+      { ox: -0.088, oz: 0.068, rx: 0.044, ry: 0.028, rz: 0.042, seed: 6.2 },
+    ];
+
+    const tmpV = new THREE.Vector3();
+    for (const sp of pebbleSpecs) {
+      const g = new THREE.IcosahedronGeometry(1.0, 1);
+      const pos = g.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        tmpV.fromBufferAttribute(pos, i);
+        const w = 0.86 + n3(tmpV.x * 1.9 + sp.seed, tmpV.y * 1.9, tmpV.z * 1.9 - sp.seed) * 0.24;
+        tmpV.multiplyScalar(w);
+        tmpV.x = tmpV.x * sp.rx + sp.ox;
+        tmpV.y = Math.max(-sp.ry * 0.42, tmpV.y * sp.ry) + sp.ry * 0.36;
+        tmpV.z = tmpV.z * sp.rz + sp.oz;
+        pos.setXYZ(i, tmpV.x, tmpV.y, tmpV.z);
+      }
+      g.computeVertexNormals();
+      parts.push(normalizeGeometry(g));
+    }
+
+    const geo = safeMergeParts(parts, 'MossyForestPebbles');
+    this._geometries.push(geo);
+
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.78,
+      metalness: 0.03,
+    });
+    this._applyWorldUpMossShader(mat, {
+      cacheKey: 'mossyForestPebbles_v1',
+      mossLow: 0.56,
+      mossHigh: 0.88,
+      mossScale: 2.8,
+    });
+    this._materials.push(mat);
+
+    const maxCount = MAX_COUNTS.pebbles;
+    const placements = [];
+    const clearingC = this.terrain.clearingCenter;
+
+    let tries = 0;
+    while (placements.length < maxCount && tries < 7500) {
+      tries++;
+      let x;
+      let z;
+      const roll = rng();
+      if (roll < 0.48) {
+        // Dense river-worn pebbles lining stream banks & gravelly shallows
+        z = (rng() * 2 - 1) * 90;
+        const scx = this.terrain.getStreamCenterX(z);
+        const hw = this.terrain.getStreamHalfWidth(z);
+        const side = rng() > 0.5 ? 1 : -1;
+        x = scx + side * (hw * 0.55 + Math.pow(rng(), 0.78) * 7.8);
+      } else if (roll < 0.72) {
+        // Clearing perimeter & trail edges
+        const a = rng() * Math.PI * 2;
+        const d = 3.0 + rng() * 18.0;
+        x = clearingC.x + Math.cos(a) * d;
+        z = clearingC.y + Math.sin(a) * d;
+      } else {
+        x = (rng() * 2 - 1) * 92;
+        z = (rng() * 2 - 1) * 92;
+      }
+
+      if (Math.abs(x) > 98 || Math.abs(z) > 98) continue;
+      if (this._isInExclusionZone(x, z, 0.35)) continue;
+      const y = this.terrain.getHeightAt(x, z);
+      if (y < -0.45) continue;
+      if (this.terrain.getSlopeAt(x, z) > 0.42) continue;
+
+      placements.push({
+        x,
+        y,
+        z,
+        yaw: rng() * Math.PI * 2,
+        scale: 0.62 + rng() * 0.92,
+      });
+    }
+
+    shuffleDeterministic(placements, rng);
+
+    const mesh = new THREE.InstancedMesh(geo, mat, maxCount);
+    mesh.name = 'ForestMossyPebbles';
+    mesh.castShadow = false;
+    mesh.receiveShadow = true;
+    mesh.frustumCulled = false;
+
+    const stonePalette = [
+      new THREE.Color('#777c79'), // cool granite grey
+      new THREE.Color('#8e8577'), // warm river sandstone
+      new THREE.Color('#5d6266'), // wet dark slate
+      new THREE.Color('#9a988e'), // pale quartz cobble
+    ];
+    const dummy = new THREE.Object3D();
+    const tNorm = new THREE.Vector3();
+    const qSlope = new THREE.Quaternion();
+    const qYaw = new THREE.Quaternion();
+    const col = new THREE.Color();
+    const count = Math.min(placements.length, maxCount);
+
+    for (let i = 0; i < count; i++) {
+      const p = placements[i];
+      this.terrain.getNormalAt(p.x, p.z, tNorm);
+      qSlope.setFromUnitVectors(UP, tNorm);
+      qYaw.setFromAxisAngle(UP, p.yaw);
+
+      dummy.position.set(p.x, p.y - 0.008, p.z);
+      dummy.quaternion.copy(qSlope).multiply(qYaw);
+      dummy.scale.set(
+        p.scale * (0.88 + rng() * 0.28),
+        p.scale * (0.78 + rng() * 0.34),
+        p.scale * (0.88 + rng() * 0.28)
+      );
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+
+      col.copy(stonePalette[Math.floor(rng() * stonePalette.length)]).multiplyScalar(0.84 + rng() * 0.30);
+      mesh.setColorAt(i, col);
+    }
+
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    this._pebblesMaxPlaced = count;
+    return mesh;
+  }
+
+  // 7C. Lush Three-Leaf Clover Patches (~520)
+  _buildCloverPatches() {
+    const rng = createRng(8841);
+    const parts = [];
+
+    // 6 delicate clover sprigs per lush ground patch, each crowned with 3 distinct leaflets at 120 deg!
+    const sprigOffsets = [
+      { ox: 0.0, oz: 0.0, h: 0.092, r: 0.036, yaw: 0.2 },
+      { ox: 0.088, oz: 0.042, h: 0.078, r: 0.032, yaw: 1.4 },
+      { ox: -0.082, oz: 0.056, h: 0.082, r: 0.033, yaw: 2.6 },
+      { ox: 0.032, oz: -0.092, h: 0.072, r: 0.030, yaw: 3.9 },
+      { ox: -0.072, oz: -0.068, h: 0.068, r: 0.029, yaw: 5.1 },
+      { ox: 0.115, oz: -0.045, h: 0.064, r: 0.028, yaw: 0.9 },
+    ];
+
+    for (const sp of sprigOffsets) {
+      // Short slender petiole stem
+      const stem = new THREE.CylinderGeometry(0.0032, 0.0042, sp.h, 4, 1);
+      stem.translate(sp.ox, sp.h * 0.5, sp.oz);
+      parts.push(
+        normalizeGeometry(stem, {
+          aBend: { itemSize: 1, fn: (_x, y) => clamp(y / 0.10, 0, 1) },
+        })
+      );
+
+      // 3 distinct radiating obovate/heart-shaped clover leaflets
+      for (let k = 0; k < 3; k++) {
+        const ang = sp.yaw + (k / 3) * Math.PI * 2;
+        const leaf = new THREE.CircleGeometry(sp.r, 6);
+        leaf.scale(0.92, 1.15, 1.0);
+        leaf.translate(0, sp.r * 0.88, 0);
+        // Slightly cupped upward to catch dappled forest sunlight
+        leaf.rotateX(-Math.PI * 0.5 + 0.18);
+        leaf.rotateY(ang);
+        leaf.translate(sp.ox, sp.h, sp.oz);
+        parts.push(
+          normalizeGeometry(leaf, {
+            aBend: { itemSize: 1, fn: () => clamp(sp.h / 0.10, 0.55, 1.0) },
+          })
+        );
+      }
+    }
+
+    const geo = safeMergeParts(parts, 'ThreeLeafCloverPatch');
+    this._geometries.push(geo);
+
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.62,
+      metalness: 0.0,
+      side: THREE.DoubleSide,
+    });
+    this.windSystem.applyFoliageWindShader(mat, {
+      bendStrength: 0.24,
+      flutterStrength: 0.09,
+      partStrength: 0.72,
+      useRootAO: true,
+      useBendAttr: true,
+    });
+    this._materials.push(mat);
+
+    const maxCount = MAX_COUNTS.clovers;
+    const placements = [];
+    const clearingC = this.terrain.clearingCenter;
+
+    let tries = 0;
+    while (placements.length < maxCount && tries < 6500) {
+      tries++;
+      let x;
+      let z;
+      const roll = rng();
+      if (roll < 0.48) {
+        // Lush clearing border meadows
+        const a = rng() * Math.PI * 2;
+        const d = 3.0 + Math.pow(rng(), 0.78) * 18.5;
+        x = clearingC.x + Math.cos(a) * d;
+        z = clearingC.y + Math.sin(a) * d;
+      } else if (roll < 0.78) {
+        // Damp mossy stream corridors
+        z = (rng() * 2 - 1) * 82;
+        const scx = this.terrain.getStreamCenterX(z);
+        const hw = this.terrain.getStreamHalfWidth(z);
+        const side = rng() > 0.5 ? 1 : -1;
+        x = scx + side * (hw + 0.9 + rng() * 12.5);
+      } else {
+        x = (rng() * 2 - 1) * 86;
+        z = (rng() * 2 - 1) * 86;
+      }
+
+      if (Math.abs(x) > 94 || Math.abs(z) > 94) continue;
+      if (this._isInExclusionZone(x, z, 0.35)) continue;
+      if (this.terrain.getClearingDistance(x, z) < 2.8) continue;
+      const y = this.terrain.getHeightAt(x, z);
+      if (y < 0.26) continue;
+      if (this.terrain.getSlopeAt(x, z) > 0.34) continue;
+      if (this._isNearBoulder(x, z, 0.15)) continue;
+
+      placements.push({
+        x,
+        y,
+        z,
+        yaw: rng() * Math.PI * 2,
+        scale: 0.76 + rng() * 0.74,
+      });
+    }
+
+    shuffleDeterministic(placements, rng);
+
+    const mesh = new THREE.InstancedMesh(geo, mat, maxCount);
+    mesh.name = 'ForestCloverPatches';
+    mesh.castShadow = false;
+    mesh.receiveShadow = true;
+    mesh.frustumCulled = false;
+
+    const cloverPalette = [
+      new THREE.Color('#2d7427'), // shamrock emerald
+      new THREE.Color('#3f8a2d'), // sunlit clover green
+      new THREE.Color('#539b35'), // fresh spring clover
+      new THREE.Color('#245f22'), // shady mossy clover
+    ];
+    const dummy = new THREE.Object3D();
+    const tNorm = new THREE.Vector3();
+    const qSlope = new THREE.Quaternion();
+    const qYaw = new THREE.Quaternion();
+    const col = new THREE.Color();
+    const count = Math.min(placements.length, maxCount);
+
+    for (let i = 0; i < count; i++) {
+      const p = placements[i];
+      this.terrain.getNormalAt(p.x, p.z, tNorm);
+      tNorm.lerp(UP, 0.35).normalize();
+      qSlope.setFromUnitVectors(UP, tNorm);
+      qYaw.setFromAxisAngle(UP, p.yaw);
+
+      dummy.position.set(p.x, p.y - 0.008, p.z);
+      dummy.quaternion.copy(qSlope).multiply(qYaw);
+      dummy.scale.set(p.scale, p.scale * (0.85 + rng() * 0.32), p.scale);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+
+      col.copy(cloverPalette[Math.floor(rng() * cloverPalette.length)]).multiplyScalar(0.88 + rng() * 0.26);
+      mesh.setColorAt(i, col);
+    }
+
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    this._cloversMaxPlaced = count;
+    return mesh;
+  }
+
+  // 7D. Clusters of Fallen Reddish-Brown Pine Needles (~520 near pines & forest soil)
+  _buildPineNeedleClusters() {
+    const rng = createRng(8861);
+    const parts = [];
+
+    // 16 slender crisscrossed reddish-brown fallen pine needles fanned softly over the forest floor
+    for (let n = 0; n < 16; n++) {
+      const a = rng() * Math.PI * 2;
+      const dist = Math.sqrt(rng()) * 0.28;
+      const ox = Math.cos(a) * dist;
+      const oz = Math.sin(a) * dist;
+      const len = 0.14 + rng() * 0.14;
+      const wid = 0.011 + rng() * 0.006;
+
+      const blade = new THREE.PlaneGeometry(wid, len, 1, 1);
+      blade.rotateX(-Math.PI * 0.5 + (rng() - 0.5) * 0.14);
+      blade.rotateY(rng() * Math.PI * 2);
+      blade.translate(ox, 0.012 + rng() * 0.014, oz);
+      parts.push(normalizeGeometry(blade));
+    }
+
+    const geo = safeMergeParts(parts, 'FallenPineNeedleCluster');
+    this._geometries.push(geo);
+
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.88,
+      metalness: 0.0,
+      side: THREE.DoubleSide,
+    });
+    this._applySimpleWetnessShader(mat, 'fallenPineNeedlesWet_v1', 0.60, 0.32);
+    this._materials.push(mat);
+
+    const maxCount = MAX_COUNTS.pineNeedles;
+    const placements = [];
+    const pineTrees = this.treePositions.filter((t) => t.species === 'pine');
+
+    let tries = 0;
+    while (placements.length < maxCount && tries < 6500) {
+      tries++;
+      let x;
+      let z;
+      if (pineTrees.length > 0 && rng() < 0.72) {
+        // Carpets beneath pine canopies & root flares
+        const pine = pineTrees[Math.floor(rng() * pineTrees.length)];
+        const a = rng() * Math.PI * 2;
+        const d = pine.radius + 0.35 + Math.pow(rng(), 0.75) * 4.6;
+        x = pine.x + Math.cos(a) * d;
+        z = pine.z + Math.sin(a) * d;
+      } else {
+        // Scattered woodland forest soil
+        x = (rng() * 2 - 1) * 94;
+        z = (rng() * 2 - 1) * 94;
+      }
+
+      if (Math.abs(x) > 98 || Math.abs(z) > 98) continue;
+      if (this._isInExclusionZone(x, z, 0.35)) continue;
+      if (this.terrain.getClearingDistance(x, z) < 3.4) continue;
+      const y = this.terrain.getHeightAt(x, z);
+      if (y < 0.25) continue;
+      if (this.terrain.getSlopeAt(x, z) > 0.36) continue;
+      if (this._isNearBoulder(x, z, 0.1)) continue;
+
+      placements.push({
+        x,
+        y,
+        z,
+        yaw: rng() * Math.PI * 2,
+        scale: 0.78 + rng() * 0.88,
+      });
+    }
+
+    shuffleDeterministic(placements, rng);
+
+    const mesh = new THREE.InstancedMesh(geo, mat, maxCount);
+    mesh.name = 'ForestPineNeedleClusters';
+    mesh.castShadow = false;
+    mesh.receiveShadow = true;
+    mesh.frustumCulled = false;
+
+    const needlePalette = [
+      new THREE.Color('#7c4322'), // rich russet pine needle
+      new THREE.Color('#925128'), // warm cinnamon auburn
+      new THREE.Color('#65361d'), // deep damp duff brown
+      new THREE.Color('#a46331'), // sunlit amber-russet needle
+    ];
+    const dummy = new THREE.Object3D();
+    const tNorm = new THREE.Vector3();
+    const qSlope = new THREE.Quaternion();
+    const qYaw = new THREE.Quaternion();
+    const col = new THREE.Color();
+    const count = Math.min(placements.length, maxCount);
+
+    for (let i = 0; i < count; i++) {
+      const p = placements[i];
+      this.terrain.getNormalAt(p.x, p.z, tNorm);
+      qSlope.setFromUnitVectors(UP, tNorm);
+      qYaw.setFromAxisAngle(UP, p.yaw);
+
+      dummy.position.set(p.x, p.y, p.z);
+      dummy.quaternion.copy(qSlope).multiply(qYaw);
+      dummy.scale.set(p.scale, p.scale, p.scale);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+
+      col.copy(needlePalette[Math.floor(rng() * needlePalette.length)]).multiplyScalar(0.86 + rng() * 0.28);
+      mesh.setColorAt(i, col);
+    }
+
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    this._pineNeedlesMaxPlaced = count;
+    return mesh;
+  }
+
+  // =========================================================================
   // QUALITY SCALING, COLLIDERS, REAL-TIME UPDATES & CLEANUP
   // =========================================================================
 
@@ -2240,6 +2843,18 @@ export class Undergrowth {
     this.logMesh.count = Math.min(cfg.logs, this._logRecords.length);
     this.stumpMesh.count = Math.min(cfg.stumps, this._stumpRecords.length);
     this.mushroomMesh.count = Math.min(cfg.mushrooms, this._mushroomsMaxPlaced ?? cfg.mushrooms);
+    if (this.twigMesh) {
+      this.twigMesh.count = Math.min(cfg.twigs, this._twigsMaxPlaced ?? cfg.twigs);
+    }
+    if (this.pebbleMesh) {
+      this.pebbleMesh.count = Math.min(cfg.pebbles, this._pebblesMaxPlaced ?? cfg.pebbles);
+    }
+    if (this.cloverMesh) {
+      this.cloverMesh.count = Math.min(cfg.clovers, this._cloversMaxPlaced ?? cfg.clovers);
+    }
+    if (this.pineNeedleMesh) {
+      this.pineNeedleMesh.count = Math.min(cfg.pineNeedles, this._pineNeedlesMaxPlaced ?? cfg.pineNeedles);
+    }
 
     // Rebuild active collision list to strictly match visible boulders, large logs & large stumps
     const activeColliders = [];

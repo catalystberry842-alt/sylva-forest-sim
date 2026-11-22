@@ -727,13 +727,27 @@ export class RatActor {
     this._alignToTerrain(1.0);
   }
 
+  setSurfaceSolver(surfaceSolver) {
+    this.surfaceSolver = surfaceSolver || null;
+  }
+
   _sampleHeight(x, z) {
+    if (this.surfaceSolver && typeof this.surfaceSolver.getHeightAt === 'function') {
+      const refY = this.position ? this.position.y + 0.45 : Infinity;
+      const h = this.surfaceSolver.getHeightAt(x, z, refY);
+      return Number.isFinite(h) ? h : 0;
+    }
     if (!this.terrain || typeof this.terrain.getHeightAt !== 'function') return 0;
     const h = this.terrain.getHeightAt(x, z);
     return Number.isFinite(h) ? h : 0;
   }
 
   _sampleNormal(x, z, target) {
+    if (this.surfaceSolver && typeof this.surfaceSolver.getNormalAt === 'function') {
+      const refY = this.position ? this.position.y + 0.45 : Infinity;
+      const n = this.surfaceSolver.getNormalAt(x, z, target, refY);
+      if (n && Number.isFinite(n.y) && n.lengthSq() > 1e-6) return n;
+    }
     if (!this.terrain || typeof this.terrain.getNormalAt !== 'function') {
       return target.set(0, 1, 0);
     }

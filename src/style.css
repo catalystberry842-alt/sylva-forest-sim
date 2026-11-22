@@ -25,11 +25,14 @@ body {
   width: 100%;
   height: 100%;
   overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
   background: #0b110d;
   color: var(--text-primary);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   user-select: none;
+  -webkit-user-select: none;
 }
 
 #viewport {
@@ -38,6 +41,8 @@ body {
   width: 100vw;
   height: 100vh;
   overflow: hidden;
+  touch-action: none;
+  overscroll-behavior: none;
   cursor: grab;
 }
 
@@ -554,6 +559,53 @@ body {
 @media (max-width: 1120px) {
   .keybind-legend {
     display: none;
+  }
+}
+
+/* Clean zero-overlap layout whenever Touch Controls are active (auto on mobile or desktop GUI toggle) */
+body.touch-ui-active .keybind-legend {
+  display: none !important;
+}
+
+body.touch-ui-active .hud-dock {
+  top: 16px;
+  bottom: auto;
+  left: 196px;
+}
+
+body.touch-ui-active .hud-dock #camera-toggle {
+  display: none;
+}
+
+body.touch-ui-active .hud-bottom-center {
+  bottom: 18px;
+  max-width: calc(100vw - 380px);
+}
+
+@media (max-width: 880px) {
+  body.touch-ui-active .forest-stats {
+    display: none !important;
+  }
+
+  body.touch-ui-active .hud-header {
+    padding: 7px 11px;
+  }
+
+  body.touch-ui-active .hud-dock {
+    top: 14px;
+    left: 174px;
+  }
+
+  body.touch-ui-active .volume-slider {
+    display: none;
+  }
+
+  body.touch-ui-active .interaction-prompt {
+    display: none;
+  }
+
+  body.touch-ui-active .stamina-container {
+    width: 186px;
   }
 }
 

@@ -62,9 +62,13 @@ class SpringDamper {
  *   'StreamWade', 'SlipRecovery', 'ThunderFlinch', 'RatPanicShake' (4 stages)
  */
 export class HumanAnimatorIK {
-  constructor(humanRig, terrain = null) {
+  constructor(humanRig, surfaceProvider = null) {
     this.rig = humanRig;
-    this.terrain = terrain;
+    this.terrain = surfaceProvider;
+    this.surfaceSolver =
+      surfaceProvider && typeof surfaceProvider.sampleSurface === 'function'
+        ? surfaceProvider
+        : null;
     this.bones = humanRig.bones;
     this.metrics = humanRig.metrics;
 
@@ -143,6 +147,8 @@ export class HumanAnimatorIK {
       canteenRoll: new SpringDamper({ stiffness: 26, damping: 2.4, maxVal: 0.78 }),
       jacketHemPitch: new SpringDamper({ stiffness: 42, damping: 6.2, maxVal: 0.52 }),
       jacketHemRoll: new SpringDamper({ stiffness: 38, damping: 5.8, maxVal: 0.38 }),
+      hairLocksPitch: new SpringDamper({ stiffness: 54, damping: 5.2, maxVal: 0.38 }),
+      hairLocksRoll: new SpringDamper({ stiffness: 50, damping: 4.8, maxVal: 0.34 }),
       headLagPitch: new SpringDamper({ stiffness: 68, damping: 9.2, maxVal: 0.26 }),
       headLagYaw: new SpringDamper({ stiffness: 64, damping: 8.8, maxVal: 0.28 }),
       headLagRoll: new SpringDamper({ stiffness: 64, damping: 8.8, maxVal: 0.22 }),
@@ -233,11 +239,23 @@ export class HumanAnimatorIK {
     this._xAxis = new THREE.Vector3(1, 0, 0);
     this._finalFootL = new THREE.Vector3();
     this._finalFootR = new THREE.Vector3();
+    this._shadowPosL = new THREE.Vector3();
+    this._shadowPosR = new THREE.Vector3();
+    this._shadowNormL = new THREE.Vector3(0, 1, 0);
+    this._shadowNormR = new THREE.Vector3(0, 1, 0);
   }
 
   // ---------------------------------------------------------------------------
   // Public Event Triggers & Queries
   // ---------------------------------------------------------------------------
+
+  setSurfaceSolver(solver) {
+    this.surfaceSolver =
+      solver && typeof solver.sampleSurface === 'function' ? solver : null;
+    if (solver && !this.terrain) {
+      this.terrain = solver;
+    }
+  }
 
   triggerSlip() {
     this._slipTimer = 0.0;
@@ -276,10 +294,61 @@ export class HumanAnimatorIK {
   }
 
   // ---------------------------------------------------------------------------
-  // Terrain Sampling Helpers (Null-Safe & NaN-Safe)
+  // Terrain & SurfaceSolver Sampling Helpers (Null-Safe & NaN-Safe)
   // ---------------------------------------------------------------------------
 
+  _sampleFootSurface(x, z, referenceY = 0, outNormal = this._tmpVecA) {
+    const provider = this.surfaceSolver || this.terrain;
+    if (provider && typeof provider.sampleSurface === 'function') {
+      outNormal.set(0, 1, 0);
+      const res = provider.sampleSurface(x, z, referenceY, outNormal);
+      let y = referenceY;
+      if (typeof res === 'number') {
+        if (Number.isFinite(res)) y = res;
+      } else if (res && typeof res === 'object') {
+        if (Number.isFinite(res.y)) {
+          y = res.y;
+        } else if (Number.isFinite(res.height)) {
+          y = res.height;
+        }
+        if (
+          res.normal &&
+          Number.isFinite(res.normal.x) &&
+          Number.isFinite(res.normal.y) &&
+          Number.isFinite(res.normal.z) &&
+          res.normal.lengthSq() > 1e-6
+        ) {
+          outNormal.copy(res.normal);
+        }
+      }
+      if (
+        Number.isFinite(outNormal.x) &&
+        Number.isFinite(outNormal.y) &&
+        Number.isFinite(outNormal.z) &&
+        outNormal.lengthSq() > 1e-6
+      ) {
+        outNormal.normalize();
+      } else {
+        outNormal.set(0, 1, 0);
+      }
+      return y;
+    }
+
+    const h = this._sampleGroundHeight(x, z, referenceY);
+    this._sampleGroundNormal(x, z, outNormal);
+    return h;
+  }
+
   _sampleGroundHeight(x, z, fallbackY = 0) {
+    const provider = this.surfaceSolver || this.terrain;
+    if (provider && typeof provider.sampleSurface === 'function') {
+      const res = provider.sampleSurface(x, z, fallbackY, this._tmpVecA);
+      if (typeof res === 'number' && Number.isFinite(res)) return res;
+      if (res && typeof res === 'object') {
+        if (Number.isFinite(res.y)) return res.y;
+        if (Number.isFinite(res.height)) return res.height;
+      }
+    }
     if (this.terrain && typeof this.terrain.getHeightAt === 'function') {
       const h = this.terrain.getHeightAt(x, z);
       if (Number.isFinite(h)) return h;
@@ -288,6 +357,30 @@ export class HumanAnimatorIK {
   }
 
   _sampleGroundNormal(x, z, target) {
+    const provider = this.surfaceSolver || this.terrain;
+    if (provider && typeof provider.sampleSurface === 'function') {
+      target.set(0, 1, 0);
+      const res = provider.sampleSurface(x, z, this._rootPos ? this._rootPos.y : 0, target);
+      if (
+        res &&
+        typeof res === 'object' &&
+        res.normal &&
+        Number.isFinite(res.normal.x) &&
+        Number.isFinite(res.normal.y) &&
+        Number.isFinite(res.normal.z) &&
+        res.normal.lengthSq() > 1e-6
+      ) {
+        target.copy(res.normal);
+      }
+      if (
+        Number.isFinite(target.x) &&
+        Number.isFinite(target.y) &&
+        Number.isFinite(target.z) &&
+        target.lengthSq() > 1e-6
+      ) {
+        return target.normalize();
+      }
+    }
     if (this.terrain && typeof this.terrain.getNormalAt === 'function') {
       this.terrain.getNormalAt(x, z, target);
       if (
@@ -330,6 +423,9 @@ export class HumanAnimatorIK {
       turnRate: Number.isFinite(locomotionState?.turnRate) ? clamp(locomotionState.turnRate, -8, 8) : 0,
       isSprinting: Boolean(locomotionState?.isSprinting),
       panickedSprint: Boolean(locomotionState?.panickedSprint),
+      windIntensity: Number.isFinite(locomotionState?.windIntensity)
+        ? clamp(locomotionState.windIntensity, 0, 4.5)
+        : 0,
       headPitchOverride: Number.isFinite(locomotionState?.headPitchOverride) ? locomotionState.headPitchOverride : null,
       headYawOverride: Number.isFinite(locomotionState?.headYawOverride) ? locomotionState.headYawOverride : null,
     };
@@ -350,6 +446,7 @@ export class HumanAnimatorIK {
       this._springs.landingBounce.impulse(-2.8 * impact);
       this._springs.backpackBounce.impulse(-0.65 * impact);
       this._springs.canteenPitch.impulse(3.2 * impact);
+      this._springs.hairLocksPitch.impulse(-1.4 * impact);
       pendingFootsteps.push({ side: 'L', intensity: clamp(0.55 + impact * 0.45, 0.4, 1.0) });
       pendingFootsteps.push({ side: 'R', intensity: clamp(0.55 + impact * 0.45, 0.4, 1.0) });
     }
@@ -406,21 +503,49 @@ export class HumanAnimatorIK {
     // Compute additive high-frequency expressive overlays (14Hz shake, 8Hz swipes, 20Hz shiver, shock flinch, blink)
     const overlay = this._computeExpressiveOverlays(safeDt, safeElapsed, loc, pendingFootsteps);
 
-    // Apply spine, torso, head, eyes, eyelids, brows, jaw, and arm poses
+    // Apply spine, torso, head, eyes, eyelids, brows, jaw, and arm/5-finger hand poses
     this._applyUpperBodyAndFace(safeDt, safeElapsed, loc, stride, overlay, landingComp);
 
-    // Compute FK leg poses + analytical 2-bone terrain-conforming Foot IK
+    // Compute FK leg poses + analytical 2-bone surface-conforming Foot IK
     this._applyLegsAndFootIK(safeDt, safeElapsed, loc, baseLocoState, stride, overlay, landingComp);
 
-    // Update secondary spring-damper physics (backpack, hanging canteen, jacket hem, head lag)
+    // Update secondary spring-damper physics (backpack, hanging canteen, jacket hem, hair locks, head lag)
     this._applySecondaryPhysics(safeDt, safeElapsed, loc, overlay);
 
     // Refresh world transforms so eyeTarget, bones, and foot positions are exact this frame
     this.rig.root.updateMatrixWorld(true);
 
+    // Query exact boot sole world coordinates & update soft ground contact-shadow decals every frame
+    this.rig.getFootWorldPositions(this._finalFootL, this._finalFootR);
+    if (typeof this.rig.updateContactShadows === 'function') {
+      const surfYL = this._sampleFootSurface(
+        this._finalFootL.x,
+        this._finalFootL.z,
+        this._rootPos.y,
+        this._shadowNormL
+      );
+      const surfYR = this._sampleFootSurface(
+        this._finalFootR.x,
+        this._finalFootR.z,
+        this._rootPos.y,
+        this._shadowNormR
+      );
+      this._shadowPosL.set(this._finalFootL.x, surfYL, this._finalFootL.z);
+      this._shadowPosR.set(this._finalFootR.x, surfYR, this._finalFootR.z);
+      const liftL = Math.max(0, this._finalFootL.y - surfYL);
+      const liftR = Math.max(0, this._finalFootR.y - surfYR);
+      this.rig.updateContactShadows(
+        this._shadowPosL,
+        this._shadowNormL,
+        liftL,
+        this._shadowPosR,
+        this._shadowNormR,
+        liftR
+      );
+    }
+
     // Emit crisp footstep callbacks with exact updated boot sole world coordinates
     if (typeof onFootstep === 'function' && pendingFootsteps.length > 0) {
-      this.rig.getFootWorldPositions(this._finalFootL, this._finalFootR);
       for (let i = 0; i < pendingFootsteps.length; i++) {
         const ev = pendingFootsteps[i];
         const pos = ev.side === 'L' ? this._finalFootL.clone() : this._finalFootR.clone();
@@ -958,6 +1083,21 @@ export class HumanAnimatorIK {
       p.fingerRCurl = 0.1;
     }
 
+    // Aerodynamic squint to eyelids & brows during FullSprint or strong forest wind
+    // (suppressed during wide-eyed terror in RatPanicShake Stage 1-2!)
+    const inShockTerror = this._panicActive && (this._panicStage === 1 || this._panicStage === 2);
+    if (!inShockTerror) {
+      const sprintSquint =
+        activeBase === 'FullSprint' ? clamp((speedRatio - 0.55) / 0.45, 0, 1) * 0.34 : 0;
+      const windSquint = smoothstep(0.75, 2.5, loc.windIntensity) * 0.32;
+      const aeroSquint = clamp(sprintSquint + windSquint, 0, 0.48);
+      if (aeroSquint > 0.001) {
+        p.eyeSquint = Math.max(p.eyeSquint, aeroSquint);
+        p.browHeight = Math.min(p.browHeight, -0.0045 * (aeroSquint / 0.34));
+        p.browTilt = Math.min(p.browTilt, -0.24 * clamp(aeroSquint / 0.32, 0, 1.25));
+      }
+    }
+
     // Override base posture slightly during panic Stage 3/4 calm-down stance
     if (this._panicActive && this._panicStage >= 3 && !stride.panicSprinting) {
       const s3Weight =
@@ -1459,14 +1599,22 @@ export class HumanAnimatorIK {
     b.upperArmL.rotation.set(armLP, armLY, armLR);
     b.forearmL.rotation.set(clamp(foreLP, -2.15, -0.04), 0, 0);
     b.wristL.rotation.set(wristLP, s.wristLYaw, wristLR);
-    // Left palm faces -X, so negative Z curls fingers inward into a fist; positive Z splays open!
-    b.fingersL.rotation.set(0, 0, -fingerLC);
 
     b.upperArmR.rotation.set(armRP, armRY, armRR);
     b.forearmR.rotation.set(clamp(foreRP, -2.15, -0.04), 0, 0);
     b.wristR.rotation.set(wristRP, s.wristRYaw, wristRR);
-    // Right palm faces +X, so positive Z curls fingers inward into a fist; negative Z splays open!
-    b.fingersR.rotation.set(0, 0, fingerRC);
+
+    // Articulate all 5 digits per hand (relaxed idle curl, tight sprint fist, wide-splayed panic fingers)
+    const splayL = fingerLC < 0 ? clamp(-fingerLC / 0.32, 0, 1) : 0;
+    const splayR = fingerRC < 0 ? clamp(-fingerRC / 0.32, 0, 1) : 0;
+    if (typeof this.rig.setHandPose === 'function') {
+      this.rig.setHandPose('L', fingerLC, splayL);
+      this.rig.setHandPose('R', fingerRC, splayR);
+    } else {
+      // Fallback for legacy single-bone finger rigs
+      b.fingersL.rotation.set(0, 0, -fingerLC);
+      b.fingersR.rotation.set(0, 0, fingerRC);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1526,17 +1674,25 @@ export class HumanAnimatorIK {
       liftR = 0;
     }
 
-    // 2. Transform desired local foot XZ into world space, sample terrain height & surface normal!
+    // 2. Transform desired local foot XZ into world space, sample height & surface normal with referenceY = rootPos.y!
     this._footLocalL.set(fxLocalL, 0, fzLocalL);
     this._footLocalR.set(fxLocalR, 0, fzLocalR);
 
     this._footWorldL.copy(this._footLocalL).applyMatrix4(this.rig.root.matrixWorld);
     this._footWorldR.copy(this._footLocalR).applyMatrix4(this.rig.root.matrixWorld);
 
-    const groundYL = this._sampleGroundHeight(this._footWorldL.x, this._footWorldL.z, this._rootPos.y);
-    const groundYR = this._sampleGroundHeight(this._footWorldR.x, this._footWorldR.z, this._rootPos.y);
-    this._sampleGroundNormal(this._footWorldL.x, this._footWorldL.z, this._normalWorldL);
-    this._sampleGroundNormal(this._footWorldR.x, this._footWorldR.z, this._normalWorldR);
+    const groundYL = this._sampleFootSurface(
+      this._footWorldL.x,
+      this._footWorldL.z,
+      this._rootPos.y,
+      this._normalWorldL
+    );
+    const groundYR = this._sampleFootSurface(
+      this._footWorldR.x,
+      this._footWorldR.z,
+      this._rootPos.y,
+      this._normalWorldR
+    );
 
     // Convert terrain surface normals into character-root local space
     this._normalLocalL.copy(this._normalWorldL).applyQuaternion(this._invRootQuat).normalize();
@@ -1829,7 +1985,36 @@ export class HumanAnimatorIK {
     const hRoll = sp.jacketHemRoll.step(dt, hemTargetRoll);
     b.jacketHem.rotation.set(hPitch, 0, hRoll);
 
-    // 4. Head inertial follow-through lag (applied next frame smoothly onto head bone)
+    // 4. Swaying front/crown hair locks spring-damper (running momentum, bounce, turns & wind flutter)
+    if (b.hairLocks) {
+      const windAmp = clamp(loc.windIntensity, 0, 3.5);
+      const windFlutterP =
+        Math.sin(elapsed * (3.6 + windAmp * 2.1) + 0.4) * (0.014 + windAmp * 0.048) +
+        Math.sin(elapsed * (7.2 + windAmp * 3.0)) * (windAmp * 0.018);
+      const windFlutterR =
+        Math.cos(elapsed * (3.1 + windAmp * 1.8) + 1.1) * (0.012 + windAmp * 0.044);
+
+      const hairTargetPitch = clamp(
+        -loc.forwardSpeed * 0.032 -
+          horizAccel * 0.012 -
+          hipsAccelY * 0.0045 -
+          (loc.grounded ? 0 : clamp(loc.verticalVel * 0.028, -0.18, 0.18)) +
+          windFlutterP +
+          panicRattle * 0.32,
+        -0.34,
+        0.34
+      );
+      const hairTargetRoll = clamp(
+        loc.turnRate * 0.068 + loc.lateralSpeed * 0.026 + windFlutterR + panicRattle * 0.24,
+        -0.30,
+        0.30
+      );
+      const hlPitch = sp.hairLocksPitch.step(dt, hairTargetPitch);
+      const hlRoll = sp.hairLocksRoll.step(dt, hairTargetRoll);
+      b.hairLocks.rotation.set(hlPitch, 0, hlRoll);
+    }
+
+    // 5. Head inertial follow-through lag (applied next frame smoothly onto head bone)
     sp.headLagPitch.step(dt, clamp(-horizAccel * 0.009 - hipsAccelY * 0.0025, -0.18, 0.18));
     sp.headLagYaw.step(dt, clamp(-loc.turnRate * 0.04, -0.2, 0.2));
     sp.headLagRoll.step(dt, clamp(loc.turnRate * 0.025, -0.14, 0.14));

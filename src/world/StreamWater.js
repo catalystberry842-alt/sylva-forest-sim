@@ -6,6 +6,7 @@ const STREAM_Z_MAX = 120;
 const WIDTH_SEGMENTS = 48;
 const LENGTH_SEGMENTS = 260;
 const MAX_IMPACT_RIPPLES = 10;
+const MAX_BRIDGE_PILINGS = 8;
 const SPLASH_POOL_SIZE = 240;
 const SPLASH_GRAVITY = -13.5;
 
@@ -13,16 +14,18 @@ const SPLASH_GRAVITY = -13.5;
  * Procedural meandering forest stream ribbon with custom WebGL2-safe GLSL water shader:
  * - Dual-scrolling downstream ripple waves + cross wind chop + concentric raindrop rings
  * - Dynamic expanding impact ripples & pooled glistening splash droplet bursts
+ * - Turbulent bridge-piling white-water foam collars & downstream V-wakes
  * - Schlick Fresnel sky reflection + crisp sun/moon specular glints
  * - Exponential depth color absorption (warm emerald shallows -> deep forest teal)
  * - Animated noise-broken shoreline foam + downstream riffle highlights
- * - Shallow projected riverbed caustics + matching FogExp2 atmospheric attenuation
+ * - High-clarity shallow projected riverbed pebble caustics + matching FogExp2 attenuation
  */
 export class StreamWater {
   constructor(terrain, windSystem = null) {
     this.terrain = terrain;
     this.windSystem = windSystem;
     this.maxImpactRipples = MAX_IMPACT_RIPPLES;
+    this.maxBridgePilings = MAX_BRIDGE_PILINGS;
 
     this._impactRippleCursor = 0;
     this._lastElapsed = 0.0;
@@ -51,6 +54,12 @@ export class StreamWater {
         value: Array.from(
           { length: MAX_IMPACT_RIPPLES },
           () => new THREE.Vector4(0, 0, -100, 0)
+        ),
+      },
+      uBridgePilings: {
+        value: Array.from(
+          { length: MAX_BRIDGE_PILINGS },
+          () => new THREE.Vector3(9999, 9999, 0)
         ),
       },
     };
@@ -272,6 +281,7 @@ export class StreamWater {
         uniform float uWindSpeed;
         uniform vec2 uWindDir;
         uniform vec4 uImpactRipples[10];
+        uniform vec3 uBridgePilings[8];
 
         varying vec3 vWorldPos;
         varying vec2 vUv;
@@ -375,14 +385,23 @@ export class StreamWater {
           return accum;
         }
 
-        // Flowing shallow caustic interference pattern
+        // Flowing dual-harmonic shallow riverbed pebble caustic interference pattern
         float computeCaustics( vec2 suv, float t ) {
-          vec2 p1 = suv * vec2( 4.6, 3.8 ) - vec2( 0.0, t * 0.78 );
-          vec2 p2 = suv * vec2( 6.1, 5.2 ) - vec2( t * 0.14, t * 1.05 );
-          float n1 = sin( p1.x * 3.2 + sin( p1.y * 2.7 + t * 1.1 ) );
-          float n2 = cos( p2.y * 3.5 + sin( p2.x * 3.1 - t * 1.3 ) );
+          vec2 p1 = suv * vec2( 4.8, 4.0 ) - vec2( 0.0, t * 0.82 );
+          vec2 p2 = suv * vec2( 6.4, 5.4 ) - vec2( t * 0.14, t * 1.08 );
+          float n1 = sin( p1.x * 3.25 + sin( p1.y * 2.75 + t * 1.15 ) );
+          float n2 = cos( p2.y * 3.55 + sin( p2.x * 3.15 - t * 1.35 ) );
           float web = 1.0 - abs( n1 + n2 ) * 0.5;
-          return pow( clamp( web, 0.0, 1.0 ), 4.4 );
+          float mainCaustic = pow( clamp( web, 0.0, 1.0 ), 3.8 );
+
+          // Crisp high-frequency shimmer filaments dancing across shallow river pebbles
+          vec2 p3 = suv * vec2( 9.8, 8.6 ) - vec2( -t * 0.18, t * 1.55 );
+          float f1 = sin( p3.x * 2.9 + cos( p3.y * 2.6 + t * 1.65 ) );
+          float f2 = cos( p3.y * 3.2 - sin( p3.x * 2.8 - t * 1.45 ) );
+          float fineWeb = 1.0 - abs( f1 + f2 ) * 0.5;
+          float shimmerSparkle = pow( clamp( fineWeb, 0.0, 1.0 ), 5.2 ) * 0.65;
+
+          return mainCaustic + shimmerSparkle;
         }
 
         void main() {
@@ -481,6 +500,62 @@ export class StreamWater {
             }
           }
 
+          // Animated turbulent white-water foam collars & downstream V-wakes around bridge pilings
+          float pilingFoam = 0.0;
+          float pilingDepthMask = smoothstep( 0.015, 0.11, depth );
+          for ( int i = 0; i < 8; i++ ) {
+            vec3 pil = uBridgePilings[i];
+            if ( pil.z > 0.001 ) {
+              vec2 relP = vWorldPos.xz - pil.xy;
+              float pDist = length( relP );
+              if ( pDist < pil.z + 4.8 ) {
+                float rPad = pil.z;
+                float along = dot( relP, flowDir );
+                float across = dot( relP, rightDir );
+                float invDist = 1.0 / max( pDist, 0.001 );
+
+                // 1. Swirling white-water collar & upstream bow wave pile-up around piling timber
+                float ringDist = max( pDist - rPad, 0.0 );
+                float angleP = atan( across, along );
+                float bowBias = smoothstep( 0.28, -0.78, along * invDist );
+                float swirlPulse = sin( angleP * 4.0 - uTime * 3.6 + ringDist * 11.0 ) * 0.5 + 0.5;
+                float collarWidth = 0.24 + rPad * 0.42 + bowBias * 0.22;
+                float collarRing = exp( -( ringDist * ringDist ) / max( collarWidth * collarWidth, 0.02 ) )
+                                 * ( 0.70 + 0.30 * swirlPulse ) * ( 0.82 + 0.38 * bowBias );
+
+                // Concentric eddy chop radiating off the piling surface
+                float eddyWave = sin( ringDist * 16.5 - uTime * 5.2 + angleP * 2.0 );
+                float eddyEnv = exp( -ringDist * 2.3 ) * smoothstep( 0.0, 0.06, ringDist );
+                worldSlope += ( relP * invDist ) * ( eddyWave * eddyEnv * 0.22 * pilingDepthMask );
+
+                // 2. Diverging downstream V-wake arms & trailing Kármán vortex froth
+                float dn = max( along + rPad * 0.24, 0.0 );
+                float spread = rPad * 0.92 + dn * 0.42;
+                float absAcross = abs( across );
+                float armDist = abs( absAcross - spread );
+                float armWidth = 0.13 + dn * 0.095;
+                float armEnv = exp( -( armDist * armDist ) / max( armWidth * armWidth, 0.015 ) );
+                float dnFade = smoothstep( 0.0, 0.24, dn ) * ( 1.0 - smoothstep( 1.25, 4.35, dn ) );
+                float armNoise = valueNoise( vec2( armDist * 5.2, dn * 3.6 - uTime * 3.5 ) );
+                float armFoam = armEnv * dnFade * ( 0.58 + 0.56 * armNoise );
+
+                // Perturb wake normals so sunlit specular streaks shimmer along the V-arms
+                float wakeSign = across >= 0.0 ? 1.0 : -1.0;
+                float wakeRidge = sin( ( absAcross - spread ) * 11.5 - uTime * 4.6 ) * armEnv * dnFade;
+                worldSlope += rightDir * ( wakeSign * wakeRidge * 0.19 * pilingDepthMask );
+
+                // Bubbly swirling eddy pocket directly in the piling's lee
+                float coreWidth = rPad * 0.82 + dn * 0.25;
+                float coreMask = exp( -( across * across ) / max( coreWidth * coreWidth, 0.025 ) );
+                float vortexSway = sin( dn * 5.4 - uTime * 4.8 + across * 3.4 ) * 0.5 + 0.5;
+                float coreFade = smoothstep( 0.0, 0.14, dn ) * ( 1.0 - smoothstep( 0.62, 2.45, dn ) );
+                float coreFoam = coreMask * coreFade * ( 0.44 + 0.56 * vortexSway ) * 0.74;
+
+                pilingFoam += ( collarRing * 0.95 + armFoam * 0.85 + coreFoam ) * pilingDepthMask;
+              }
+            }
+          }
+
           vec3 N = normalize( vec3( -worldSlope.x, 1.0, -worldSlope.y ) );
           vec3 V = normalize( cameraPosition - vWorldPos );
           vec3 L = normalize( uSunDir );
@@ -508,9 +583,9 @@ export class StreamWater {
           vec3 specular = uSunColor * ( specSharp + specBroad ) * ( 0.26 + uSunIntensity * 1.15 )
                         * rainSpecDamp * grazingBoost * lightElevFade;
 
-          // Exponential depth color absorption (warm emerald shallows -> deep forest teal)
-          vec3 absorption = exp( -depth * vec3( 0.58, 0.22, 0.14 ) );
-          vec3 shallowTint = vec3( 0.14, 0.32, 0.22 );
+          // Exponential depth color absorption (warm crystal-emerald shallows -> deep forest teal)
+          vec3 absorption = exp( -depth * vec3( 0.54, 0.20, 0.13 ) );
+          vec3 shallowTint = vec3( 0.16, 0.35, 0.24 );
           vec3 deepTint = vec3( 0.010, 0.052, 0.068 );
           vec3 waterScatter = mix( deepTint, shallowTint, clamp( absorption.g, 0.0, 1.0 ) );
 
@@ -520,17 +595,22 @@ export class StreamWater {
                           + uSunColor * max( L.y, 0.04 ) * ( 0.06 + uSunIntensity * 0.52 );
           vec3 bodyColor = waterScatter * irradiance * mix( 0.65, 1.18, clamp( skyLuma * 2.2, 0.0, 1.0 ) );
 
-          // Subtle projected riverbed caustics visible through shallow transparent water in daylight
-          vec2 refractedUv = vUv - vec2( dot( N.xz, rightDir ), dot( N.xz, flowDir ) ) * min( depth, 1.0 ) * 0.16;
+          // High-clarity projected shallow riverbed pebble caustics (depth < 0.78)
+          vec2 refractedUv = vUv - vec2( dot( N.xz, rightDir ), dot( N.xz, flowDir ) ) * min( depth, 0.9 ) * 0.18;
           float caustics = computeCaustics( refractedUv, uTime );
-          float causticMask = smoothstep( 0.04, 0.18, depth ) * exp( -depth * 1.75 );
-          float dayCausticVis = smoothstep( 0.12, 0.65, uSunIntensity ) * ( 1.0 - uRainIntensity * 0.7 );
-          vec3 causticLight = uSunColor * vec3( 0.72, 1.0, 0.88 ) * caustics * causticMask
-                            * absorption * dayCausticVis * 0.38;
+          float shallowDepthZone = smoothstep( 0.025, 0.13, depth ) * ( 1.0 - smoothstep( 0.52, 0.78, depth ) );
+          float causticMask = shallowDepthZone * exp( -depth * 1.05 )
+                            + smoothstep( 0.14, 0.42, depth ) * exp( -depth * 2.15 ) * 0.22;
+          float dayCausticVis = smoothstep( 0.08, 0.58, uSunIntensity ) * ( 1.0 - uRainIntensity * 0.64 );
+          vec3 causticLight = uSunColor * vec3( 0.80, 1.0, 0.88 ) * caustics * causticMask
+                            * absorption * dayCausticVis * 0.86;
           bodyColor += causticLight;
 
-          // Combine refracted stream body with Fresnel sky reflection + specular sparkle
-          vec3 waterColor = mix( bodyColor, reflectionColor, clamp( fresnel * 0.90, 0.0, 0.90 ) ) + specular;
+          // Combine refracted stream body with Fresnel sky reflection + crisp specular & shallow caustic sparkle
+          float shallowReflFade = mix( 0.66, 0.90, smoothstep( 0.14, 0.78, depth ) );
+          vec3 waterColor = mix( bodyColor, reflectionColor, clamp( fresnel * shallowReflFade, 0.0, 0.90 ) )
+                          + specular
+                          + causticLight * 0.28;
 
           // Organic noise-broken shoreline foam where depth < 0.25 + subtle downstream riffle highlights
           float foamMacro = fbm3( vUv * vec2( 2.8, 2.2 ) - vec2( 0.0, uTime * 0.36 ) );
@@ -550,14 +630,17 @@ export class StreamWater {
           float riffleFoam = smoothstep( 0.16, 0.36, waveSteepness ) * riffleMask * smoothstep( 0.48, 0.78, foamFine ) * 0.36;
 
           float impactCrestFoam = clamp( impactFoam * ( 0.72 + foamFine * 0.38 ), 0.0, 0.86 );
-          float foamAmount = clamp( foamEdge + riffleFoam + impactCrestFoam, 0.0, 0.88 );
-          vec3 foamAlbedo = vec3( 0.91, 0.94, 0.90 );
-          vec3 foamLit = foamAlbedo * ( uSkyHorizonColor * 0.42 + uSunColor * max( L.y, 0.06 ) * ( 0.08 + uSunIntensity * 0.56 ) );
+          float pilingCrestFoam = clamp( pilingFoam * ( 0.64 + foamLace * 0.34 + foamFine * 0.28 ), 0.0, 0.94 );
+          float foamAmount = clamp( foamEdge + riffleFoam + impactCrestFoam + pilingCrestFoam, 0.0, 0.93 );
+          vec3 foamAlbedo = vec3( 0.92, 0.95, 0.91 );
+          vec3 foamLit = foamAlbedo * ( uSkyHorizonColor * 0.44 + uSunColor * max( L.y, 0.06 ) * ( 0.10 + uSunIntensity * 0.58 ) );
           waterColor = mix( waterColor, foamLit, foamAmount );
 
-          // Physically inspired opacity: crystal-clear shallows -> rich deep teal, boosted by Fresnel & foam
-          float depthAlpha = 1.0 - exp( -depth * 1.75 );
-          float alpha = clamp( max( depthAlpha, max( fresnel * 0.85, foamAmount * 0.88 ) ), 0.0, 0.96 ) * edgeAlpha;
+          // Physically inspired opacity: extra-clear sunlit shallows (< 0.78m) reveal pebbles & caustics -> rich deep teal
+          float shallowClarity = mix( 0.74, 1.0, smoothstep( 0.16, 0.78, depth ) );
+          float depthAlpha = ( 1.0 - exp( -depth * 1.62 ) ) * shallowClarity;
+          float causticBoostAlpha = clamp( caustics * causticMask * dayCausticVis * 0.22, 0.0, 0.24 );
+          float alpha = clamp( max( depthAlpha + causticBoostAlpha, max( fresnel * 0.82, foamAmount * 0.90 ) ), 0.0, 0.96 ) * edgeAlpha;
 
           // Match Three.js FogExp2 atmospheric distance fog
           float dist = length( cameraPosition - vWorldPos );
@@ -685,6 +768,47 @@ export class StreamWater {
     points.frustumCulled = false;
     points.renderOrder = 3;
     return points;
+  }
+
+  /**
+   * Registers up to 8 submerged bridge piling footprints `(x, z, radius)` for animated
+   * white-water collar foam & downstream V-wake generation in the stream shader.
+   */
+  setBridgePilings(pilings = []) {
+    const slots = this.uniforms.uBridgePilings.value;
+    const list = Array.isArray(pilings) ? pilings : [];
+
+    for (let i = 0; i < MAX_BRIDGE_PILINGS; i++) {
+      const slot = slots[i];
+      if (i < list.length && list[i]) {
+        const p = list[i];
+        let x = 9999;
+        let z = 9999;
+        let r = 0;
+
+        if (Array.isArray(p) && p.length >= 3) {
+          x = Number(p[0]);
+          z = Number(p[1]);
+          r = Number(p[2]);
+        } else if (typeof p === 'object') {
+          if ('radius' in p) {
+            x = Number(p.position ? p.position.x : p.x);
+            z = Number(p.position ? p.position.z : p.z);
+            r = Number(p.radius);
+          } else if (p.isVector3 || ('x' in p && 'y' in p && 'z' in p)) {
+            x = Number(p.x);
+            z = Number(p.y);
+            r = Number(p.z);
+          }
+        }
+
+        if (Number.isFinite(x) && Number.isFinite(z) && Number.isFinite(r) && r > 0.001) {
+          slot.set(x, z, r);
+          continue;
+        }
+      }
+      slot.set(9999, 9999, 0);
+    }
   }
 
   /**

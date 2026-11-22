@@ -446,10 +446,11 @@ function buildCuppedFoliageCard({
  * and populates an ecologically zoned instanced forest across the terrain.
  */
 export class TreeFactory {
-  constructor(scene, terrain, windSystem) {
+  constructor(scene, terrain, windSystem, exclusionZones = []) {
     this.scene = scene;
     this.terrain = terrain;
     this.windSystem = windSystem;
+    this.exclusionZones = Array.isArray(exclusionZones) ? exclusionZones : [];
 
     this.group = new THREE.Group();
     this.group.name = 'ForestTrees';
@@ -523,10 +524,11 @@ export class TreeFactory {
 
       this._geometries.push(proto.barkGeo, proto.foliageGeo);
 
+      const barkNormalAmp = species === 'birch' ? 0.95 : species === 'oak' ? 1.42 : 1.48;
       const barkMat = new THREE.MeshStandardMaterial({
         map: tex.bark.diffuse,
         normalMap: tex.bark.normal,
-        normalScale: new THREE.Vector2(species === 'birch' ? 0.75 : 1.15, species === 'birch' ? 0.75 : 1.15),
+        normalScale: new THREE.Vector2(barkNormalAmp, barkNormalAmp),
         roughness: profile.barkRoughness,
         metalness: 0.0,
         vertexColors: false, // geometry `color` drives wind ONLY; instanceColor tints per-tree!
@@ -542,6 +544,8 @@ export class TreeFactory {
       });
 
       const barkDepthMat = this.windSystem.applyTreeWindShader(barkMat, profile.bark);
+      // Chain north-facing & root-collar mossy bark shading cleanly WITHOUT overwriting windSystem's hook!
+      this._chainNorthMossBarkShader(barkMat, species);
       const foliageDepthMat = this.windSystem.applyTreeWindShader(foliageMat, profile.foliage);
 
       this._materials.push(barkMat, foliageMat);
@@ -603,6 +607,111 @@ export class TreeFactory {
 
     // Apply initial High quality preset & populate active colliders + treePositions
     this.setQuality('High');
+  }
+
+  _isInExclusionZone(x, z, extraPad = 0.0) {
+    for (let i = 0; i < this.exclusionZones.length; i++) {
+      const zone = this.exclusionZones[i];
+      if (!zone) continue;
+      const r = (zone.radius ?? 0) + extraPad;
+      if (r <= 0) continue;
+      const dx = x - zone.x;
+      const dz = z - zone.z;
+      if (dx * dx + dz * dz < r * r) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Chains organic north-facing (-Z) & lower root-collar velvety moss shading
+   * onto a tree bark material AFTER windSystem.applyTreeWindShader without
+   * overwriting windSystem's onBeforeCompile hook.
+   */
+  _chainNorthMossBarkShader(barkMat, species) {
+    const prevCompile = barkMat.onBeforeCompile;
+    const prevKey = barkMat.customProgramCacheKey;
+
+    const mossStrength = species === 'oak' ? '0.80' : species === 'pine' ? '0.66' : '0.38';
+    const maxMossH = species === 'oak' ? '6.6' : species === 'pine' ? '5.8' : '3.4';
+
+    barkMat.customProgramCacheKey = () =>
+      `${prevKey ? prevKey() : 'treeBark'}_northMoss_${species}_v1`;
+
+    barkMat.onBeforeCompile = (shader, renderer) => {
+      if (prevCompile) prevCompile(shader, renderer);
+
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <common>',
+        `#include <common>
+        varying vec3 vBarkWorldPos;
+        varying vec3 vBarkWorldNormal;
+        varying float vBarkLocalY;`
+      );
+
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+        vBarkLocalY = position.y;
+        {
+          vec4 barkWp = vec4( position, 1.0 );
+          mat3 barkM3 = mat3( modelMatrix );
+          #ifdef USE_INSTANCING
+            barkWp = instanceMatrix * barkWp;
+            barkM3 = barkM3 * mat3( instanceMatrix );
+          #endif
+          barkWp = modelMatrix * barkWp;
+          vBarkWorldPos = barkWp.xyz;
+          vBarkWorldNormal = normalize( transpose( inverse( barkM3 ) ) * objectNormal );
+        }`
+      );
+
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <common>',
+        `#include <common>
+        varying vec3 vBarkWorldPos;
+        varying vec3 vBarkWorldNormal;
+        varying float vBarkLocalY;
+
+        float barkMossHash( vec2 p ) {
+          return fract( sin( dot( p, vec2( 127.1, 311.7 ) ) ) * 43758.5453 );
+        }
+        float barkMossNoise( vec2 p ) {
+          vec2 i = floor( p );
+          vec2 f = fract( p );
+          vec2 u = f * f * ( 3.0 - 2.0 * f );
+          return mix(
+            mix( barkMossHash( i ), barkMossHash( i + vec2( 1.0, 0.0 ) ), u.x ),
+            mix( barkMossHash( i + vec2( 0.0, 1.0 ) ), barkMossHash( i + vec2( 1.0, 1.0 ) ), u.x ),
+            u.y
+          );
+        }`
+      );
+
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+        vec3 barkWN = normalize( vBarkWorldNormal );
+        float bmMacro = barkMossNoise( vec2( vBarkWorldPos.x * 1.15 + vBarkWorldPos.z * 0.85, vBarkWorldPos.y * 0.52 ) );
+        float bmFine = barkMossNoise( vec2( vBarkWorldPos.x * 3.4 - vBarkWorldPos.z * 2.9, vBarkWorldPos.y * 1.85 ) );
+        float bmPatch = bmMacro * 0.62 + bmFine * 0.38;
+
+        // North-facing (-Z) shaded damp bark preference + upward-facing root-flare moss ledges
+        float northFace = smoothstep( -0.18, 0.68, -barkWN.z + barkWN.y * 0.28 + ( bmPatch - 0.48 ) * 0.32 );
+        float rootUpFace = smoothstep( 0.25, 0.78, barkWN.y + ( bmPatch - 0.5 ) * 0.24 );
+        float trunkHeightFade = 1.0 - smoothstep( 0.55, ${maxMossH}, vBarkLocalY + ( bmMacro - 0.5 ) * 1.55 );
+        float basalCollar = ( 1.0 - smoothstep( -0.15, 1.45, vBarkLocalY + ( bmFine - 0.5 ) * 0.45 ) ) * ( 0.45 + 0.55 * rootUpFace );
+
+        float barkNorthMoss = clamp( max( northFace * trunkHeightFade, basalCollar * 0.92 ) * smoothstep( 0.26, 0.74, bmPatch ) * ${mossStrength}, 0.0, 0.85 );
+        vec3 barkMossCol = mix( vec3( 0.048, 0.132, 0.028 ), vec3( 0.142, 0.268, 0.054 ), bmPatch );
+        diffuseColor.rgb = mix( diffuseColor.rgb, barkMossCol, barkNorthMoss );`
+      );
+
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+        roughnessFactor = mix( roughnessFactor, 0.94, barkNorthMoss * 0.58 );`
+      );
+    };
   }
 
   // =========================================================================
@@ -796,9 +905,9 @@ export class TreeFactory {
     diffuse.flipY = true;
     diffuse.needsUpdate = true;
 
-    // Sobel tangent-space normal map from seamless height buffer
+    // Deepened Sobel tangent-space normal map from seamless height buffer
     const normData = new Uint8Array(size * size * 4);
-    const strength = species === 'pine' ? 3.8 : species === 'oak' ? 3.4 : 2.1;
+    const strength = species === 'pine' ? 5.4 : species === 'oak' ? 4.9 : 2.95;
     const hAt = (ix, iy) => heightBuf[((iy + size) % size) * size + ((ix + size) % size)];
 
     for (let y = 0; y < size; y++) {
@@ -1326,11 +1435,11 @@ export class TreeFactory {
       buildOrganicTube({
         points: trunkPts,
         radii: trunkRadii,
-        radialSegs: 9,
-        flareStrength: 0.72,
+        radialSegs: 10,
+        flareStrength: 0.94,
         flareLobes: 5,
-        flareHeightFrac: 0.18,
-        gnarlAmp: 0.05,
+        flareHeightFrac: 0.21,
+        gnarlAmp: 0.055,
         gnarlPhase: 0.8,
         uvRepeatU: 2.0,
         uvScaleV: 0.36,
@@ -1339,6 +1448,41 @@ export class TreeFactory {
         aoFn: calcBarkAO,
       })
     );
+
+    // 5 sculpted radiating buttress root spurs anchoring the pine trunk deep into forest soil
+    const rootZeroWind = (_x, _y, _z, _u, _v, _i, out) => {
+      out[0] = 0.0;
+      out[1] = 0.0;
+      out[2] = 0.0;
+    };
+    const pineBase = trunkPointAt(0.0);
+    for (let rIdx = 0; rIdx < 5; rIdx++) {
+      const rAz = (rIdx / 5) * Math.PI * 2 + 0.16 + (rng() - 0.5) * 0.28;
+      const rdx = Math.cos(rAz);
+      const rdz = Math.sin(rAz);
+      const reach = 1.38 + rng() * 0.42;
+      const bend = (rng() - 0.5) * 0.24;
+      const rPts = [
+        new THREE.Vector3(pineBase.x + rdx * 0.24, 1.05 + rng() * 0.22, pineBase.z + rdz * 0.24),
+        new THREE.Vector3(pineBase.x + rdx * (reach * 0.42) - rdz * bend * 0.5, 0.48, pineBase.z + rdz * (reach * 0.42) + rdx * bend * 0.5),
+        new THREE.Vector3(pineBase.x + rdx * (reach * 0.78) - rdz * bend, 0.06, pineBase.z + rdz * (reach * 0.78) + rdx * bend),
+        new THREE.Vector3(pineBase.x + rdx * reach - rdz * bend * 1.15, -0.58, pineBase.z + rdz * reach + rdx * bend * 1.15),
+      ];
+      barkParts.push(
+        buildOrganicTube({
+          points: rPts,
+          radii: [0.30, 0.23, 0.14, 0.055],
+          radialSegs: 6,
+          gnarlAmp: 0.08,
+          gnarlPhase: rIdx * 1.7,
+          uvRepeatU: 1.0,
+          uvScaleV: 0.6,
+          capTip: true,
+          windFn: rootZeroWind,
+          aoFn: (_x, y) => clamp(0.56 + smoothstep(-0.35, 0.9, y) * 0.28, 0.52, 0.86),
+        })
+      );
+    }
 
     // 7 tiered whorls of drooping outward boughs tapering into a conical spire
     const whorls = [
@@ -1560,11 +1704,11 @@ export class TreeFactory {
       buildOrganicTube({
         points: trunkPts,
         radii: trunkRadii,
-        radialSegs: 10,
-        flareStrength: 0.78,
+        radialSegs: 11,
+        flareStrength: 1.06,
         flareLobes: 6,
-        flareHeightFrac: 0.38,
-        gnarlAmp: 0.085,
+        flareHeightFrac: 0.42,
+        gnarlAmp: 0.092,
         gnarlPhase: 1.6,
         uvRepeatU: 2.2,
         uvScaleV: 0.42,
@@ -1573,6 +1717,41 @@ export class TreeFactory {
         aoFn: calcOakBarkAO,
       })
     );
+
+    // 6 gnarled spreading oak buttress roots gripping visibly into forest soil
+    const oakRootZeroWind = (_x, _y, _z, _u, _v, _i, out) => {
+      out[0] = 0.0;
+      out[1] = 0.0;
+      out[2] = 0.0;
+    };
+    const oakBase = trunkPts[1];
+    for (let rIdx = 0; rIdx < 6; rIdx++) {
+      const rAz = (rIdx / 6) * Math.PI * 2 + 0.25 + (rng() - 0.5) * 0.26;
+      const rdx = Math.cos(rAz);
+      const rdz = Math.sin(rAz);
+      const reach = 1.72 + rng() * 0.52;
+      const kink = (rng() - 0.5) * 0.36;
+      const rPts = [
+        new THREE.Vector3(oakBase.x + rdx * 0.34, 1.28 + rng() * 0.28, oakBase.z + rdz * 0.34),
+        new THREE.Vector3(oakBase.x + rdx * (reach * 0.38) - rdz * kink * 0.45, 0.58 + rng() * 0.14, oakBase.z + rdz * (reach * 0.38) + rdx * kink * 0.45),
+        new THREE.Vector3(oakBase.x + rdx * (reach * 0.72) - rdz * kink, 0.12, oakBase.z + rdz * (reach * 0.72) + rdx * kink),
+        new THREE.Vector3(oakBase.x + rdx * reach - rdz * kink * 1.15, -0.58, oakBase.z + rdz * reach + rdx * kink * 1.15),
+      ];
+      barkParts.push(
+        buildOrganicTube({
+          points: rPts,
+          radii: [0.38, 0.28, 0.17, 0.065],
+          radialSegs: 6,
+          gnarlAmp: 0.11,
+          gnarlPhase: rIdx * 2.1,
+          uvRepeatU: 1.1,
+          uvScaleV: 0.58,
+          capTip: true,
+          windFn: oakRootZeroWind,
+          aoFn: (_x, y) => clamp(0.54 + smoothstep(-0.35, 1.0, y) * 0.30, 0.50, 0.86),
+        })
+      );
+    }
 
     const clusterCenters = [];
 
@@ -1818,11 +1997,11 @@ export class TreeFactory {
       buildOrganicTube({
         points: trunkPts,
         radii: trunkRadii,
-        radialSegs: 8,
-        flareStrength: 0.45,
+        radialSegs: 9,
+        flareStrength: 0.68,
         flareLobes: 4,
-        flareHeightFrac: 0.14,
-        gnarlAmp: 0.025,
+        flareHeightFrac: 0.18,
+        gnarlAmp: 0.032,
         gnarlPhase: 0.5,
         uvRepeatU: 1.5,
         uvScaleV: 0.48,
@@ -1831,6 +2010,41 @@ export class TreeFactory {
         aoFn: calcBirchBarkAO,
       })
     );
+
+    // 4 graceful anchoring birch buttress root spurs gripping the forest soil
+    const birchRootZeroWind = (_x, _y, _z, _u, _v, _i, out) => {
+      out[0] = 0.0;
+      out[1] = 0.0;
+      out[2] = 0.0;
+    };
+    const birchBase = trunkPosAt(0.04);
+    for (let rIdx = 0; rIdx < 4; rIdx++) {
+      const rAz = (rIdx / 4) * Math.PI * 2 + 0.35 + (rng() - 0.5) * 0.34;
+      const rdx = Math.cos(rAz);
+      const rdz = Math.sin(rAz);
+      const reach = 0.78 + rng() * 0.28;
+      const bend = (rng() - 0.5) * 0.14;
+      const rPts = [
+        new THREE.Vector3(birchBase.x + rdx * 0.12, 0.56 + rng() * 0.14, birchBase.z + rdz * 0.12),
+        new THREE.Vector3(birchBase.x + rdx * (reach * 0.46) - rdz * bend * 0.5, 0.24, birchBase.z + rdz * (reach * 0.46) + rdx * bend * 0.5),
+        new THREE.Vector3(birchBase.x + rdx * (reach * 0.78) - rdz * bend, 0.02, birchBase.z + rdz * (reach * 0.78) + rdx * bend),
+        new THREE.Vector3(birchBase.x + rdx * reach - rdz * bend * 1.1, -0.45, birchBase.z + rdz * reach + rdx * bend * 1.1),
+      ];
+      barkParts.push(
+        buildOrganicTube({
+          points: rPts,
+          radii: [0.15, 0.11, 0.07, 0.032],
+          radialSegs: 5,
+          gnarlAmp: 0.05,
+          gnarlPhase: rIdx * 1.4,
+          uvRepeatU: 1.0,
+          uvScaleV: 0.7,
+          capTip: true,
+          windFn: birchRootZeroWind,
+          aoFn: (_x, y) => clamp(0.62 + smoothstep(-0.3, 0.65, y) * 0.26, 0.58, 0.9),
+        })
+      );
+    }
 
     // 14 ascending thin upper branches arching delicately outward + airy leaf clusters
     const mCard = new THREE.Matrix4();
@@ -2067,6 +2281,7 @@ export class TreeFactory {
 
     const isValidSite = (x, z) => {
       if (Math.abs(x) > HALF_EXTENT || Math.abs(z) > HALF_EXTENT) return null;
+      if (this._isInExclusionZone(x, z, 0.75)) return null;
       const distClearing = this.terrain.getClearingDistance(x, z);
       if (distClearing <= 11.4) return null;
 

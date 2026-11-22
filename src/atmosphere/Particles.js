@@ -6,6 +6,7 @@ const MAX_POLLEN = 1200;
 const MAX_LEAVES = 420;
 const MAX_FIREFLIES = 360;
 const MAX_RAIN = 3400;
+const MAX_SHELTER_BOXES = 4;
 
 const QUALITY_COUNTS = {
   medium: {
@@ -635,6 +636,18 @@ export class Particles {
       uStreakVec: { value: new THREE.Vector3(0.18, -1.0, 0.06) },
       uRainIntensity: { value: 0.0 },
       uRainColor: { value: new THREE.Color(0xbcd0e2) },
+      uShelterMin: {
+        value: Array.from(
+          { length: MAX_SHELTER_BOXES },
+          () => new THREE.Vector3(9999, 9999, 9999)
+        ),
+      },
+      uShelterMax: {
+        value: Array.from(
+          { length: MAX_SHELTER_BOXES },
+          () => new THREE.Vector3(-9999, -9999, -9999)
+        ),
+      },
     };
 
     const material = new THREE.ShaderMaterial({
@@ -656,6 +669,7 @@ export class Particles {
 
         varying float vAlpha;
         varying float vEnd;
+        varying vec3 vWorldPos;
 
         void main() {
           vEnd = aEnd;
@@ -665,6 +679,7 @@ export class Particles {
           vec3 halfBox = uBoxSize * 0.5;
           vec3 rel = mod( position + drift - uCenterPos + halfBox, uBoxSize ) - halfBox;
           vec3 worldPos = uCenterPos + rel + uStreakVec * ( aEnd * aLength );
+          vWorldPos = worldPos;
 
           // Soft fade near box boundaries & immediate camera near plane
           float xzNorm = length( rel.xz ) / max( halfBox.x, 0.001 );
@@ -683,11 +698,25 @@ export class Particles {
       fragmentShader: /* glsl */ `
         uniform float uRainIntensity;
         uniform vec3 uRainColor;
+        uniform vec3 uShelterMin[4];
+        uniform vec3 uShelterMax[4];
 
         varying float vAlpha;
         varying float vEnd;
+        varying vec3 vWorldPos;
 
         void main() {
+          // Physically clip rain streaks at roof / cave / hollow-trunk shelter volumes
+          for ( int i = 0; i < 4; i++ ) {
+            vec3 sMin = uShelterMin[i];
+            vec3 sMax = uShelterMax[i];
+            if ( sMin.x < sMax.x ) {
+              if ( all( greaterThanEqual( vWorldPos, sMin ) ) && all( lessThanEqual( vWorldPos, sMax ) ) ) {
+                discard;
+              }
+            }
+          }
+
           // Subtle tapered raindrop streak: whisper-thin tail -> brighter drop head
           float taper = mix( 0.14, 0.95, vEnd );
           float alpha = vAlpha * taper * uRainIntensity * 0.46;
@@ -706,6 +735,82 @@ export class Particles {
     this.rainMesh.renderOrder = 7;
     this.rainMesh.visible = false;
     this.scene.add(this.rainMesh);
+  }
+
+  /**
+   * Registers up to 4 world-space axis-aligned shelter volumes (cabin interior/roof,
+   * hollow redwood trunk, mossy stone cavern) where rain streaks are clipped cleanly.
+   * Accepts THREE.Box3, `{ min, max }`, `{ minX..maxZ }`, or `{ center, size }`.
+   */
+  setShelterBoxes(boxes = []) {
+    if (!this._rainUniforms) return;
+    const mins = this._rainUniforms.uShelterMin.value;
+    const maxs = this._rainUniforms.uShelterMax.value;
+    const list = Array.isArray(boxes) ? boxes : [];
+
+    for (let i = 0; i < MAX_SHELTER_BOXES; i++) {
+      const dstMin = mins[i];
+      const dstMax = maxs[i];
+      const box = i < list.length ? list[i] : null;
+
+      let hasBox = false;
+      let minX = 0;
+      let minY = 0;
+      let minZ = 0;
+      let maxX = 0;
+      let maxY = 0;
+      let maxZ = 0;
+
+      if (box && typeof box === 'object') {
+        if (box.min && box.max) {
+          minX = Number(box.min.x);
+          minY = Number(box.min.y);
+          minZ = Number(box.min.z);
+          maxX = Number(box.max.x);
+          maxY = Number(box.max.y);
+          maxZ = Number(box.max.z);
+          hasBox = true;
+        } else if (box.center && box.size) {
+          const hx = Math.abs(Number(box.size.x)) * 0.5;
+          const hy = Math.abs(Number(box.size.y)) * 0.5;
+          const hz = Math.abs(Number(box.size.z)) * 0.5;
+          minX = Number(box.center.x) - hx;
+          minY = Number(box.center.y) - hy;
+          minZ = Number(box.center.z) - hz;
+          maxX = Number(box.center.x) + hx;
+          maxY = Number(box.center.y) + hy;
+          maxZ = Number(box.center.z) + hz;
+          hasBox = true;
+        } else if ('minX' in box && 'maxX' in box) {
+          minX = Number(box.minX);
+          minY = Number(box.minY);
+          minZ = Number(box.minZ);
+          maxX = Number(box.maxX);
+          maxY = Number(box.maxY);
+          maxZ = Number(box.maxZ);
+          hasBox = true;
+        }
+      }
+
+      if (
+        hasBox &&
+        Number.isFinite(minX) &&
+        Number.isFinite(minY) &&
+        Number.isFinite(minZ) &&
+        Number.isFinite(maxX) &&
+        Number.isFinite(maxY) &&
+        Number.isFinite(maxZ) &&
+        minX !== maxX &&
+        minY !== maxY &&
+        minZ !== maxZ
+      ) {
+        dstMin.set(Math.min(minX, maxX), Math.min(minY, maxY), Math.min(minZ, maxZ));
+        dstMax.set(Math.max(minX, maxX), Math.max(minY, maxY), Math.max(minZ, maxZ));
+      } else {
+        dstMin.set(9999, 9999, 9999);
+        dstMax.set(-9999, -9999, -9999);
+      }
+    }
   }
 
   setQuality(preset = 'High') {

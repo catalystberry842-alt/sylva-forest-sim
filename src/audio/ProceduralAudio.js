@@ -45,6 +45,16 @@ export class ProceduralAudio {
     // Campfire rumble node
     this._fireRumbleGain = null;
 
+    // Acoustic zone ('outdoor' | 'wood' | 'cave') shelter muffling & cavern echo bus
+    this._acousticZone = 'outdoor';
+    this._outdoorShelterFilter = null;
+    this._outdoorShelterGain = null;
+    this._caveSendGain = null;
+    this._caveDelay = null;
+    this._caveLowpass = null;
+    this._caveFeedbackGain = null;
+    this._caveWetGain = null;
+
     // Stochastic event schedulers
     this._nextCrackleTimer = 0.08;
     this._nextBubbleTimer = 0.22;
@@ -122,6 +132,65 @@ export class ProceduralAudio {
     return this._volume;
   }
 
+  /**
+   * Switches acoustic environment zone ('outdoor' | 'wood' | 'cave'):
+   * - 'outdoor': full crisp canopy wind & rain, dry one-shots
+   * - 'wood': softly dampens outdoor wind & rain (~0.42x) with warm timber shelter muffling
+   * - 'cave': muffles outdoor wind & rain and routes footsteps/gasp/thunder into a warm
+   *   stone cavern feedback-delay echo (delay 0.16s, lowpass 1800 Hz, feedback 0.36, wet 0.42)
+   */
+  setAcousticZone(zone = 'outdoor') {
+    const raw = String(zone || 'outdoor').toLowerCase();
+    const normalized =
+      raw === 'cave' || raw === 'cavern'
+        ? 'cave'
+        : raw === 'wood' || raw === 'cabin' || raw === 'redwood' || raw === 'indoor'
+          ? 'wood'
+          : 'outdoor';
+
+    this._acousticZone = normalized;
+    this._applyAcousticZone(0.18);
+    return this._acousticZone;
+  }
+
+  getAcousticZone() {
+    return this._acousticZone;
+  }
+
+  _applyAcousticZone(tau = 0.18) {
+    if (!this._ctx) return;
+    const now = this._ctx.currentTime;
+    const zone = this._acousticZone;
+
+    let outdoorGain = 1.0;
+    let outdoorCutoff = 18000;
+    let caveSend = 0.0;
+    let caveWet = 0.0;
+
+    if (zone === 'wood') {
+      outdoorGain = 0.42;
+      outdoorCutoff = 2200;
+    } else if (zone === 'cave') {
+      outdoorGain = 0.28;
+      outdoorCutoff = 980;
+      caveSend = 1.0;
+      caveWet = 0.42;
+    }
+
+    if (this._outdoorShelterGain) {
+      this._outdoorShelterGain.gain.setTargetAtTime(outdoorGain, now, tau);
+    }
+    if (this._outdoorShelterFilter) {
+      this._outdoorShelterFilter.frequency.setTargetAtTime(outdoorCutoff, now, tau);
+    }
+    if (this._caveSendGain) {
+      this._caveSendGain.gain.setTargetAtTime(caveSend, now, Math.min(tau, 0.08));
+    }
+    if (this._caveWetGain) {
+      this._caveWetGain.gain.setTargetAtTime(caveWet, now, tau);
+    }
+  }
+
   _applyMasterGain(tau = 0.08) {
     if (!this._ctx || !this._masterGain) return;
     const now = this._ctx.currentTime;
@@ -151,6 +220,45 @@ export class ProceduralAudio {
     this._compressor.connect(this._masterGain);
     this._masterGain.connect(ctx.destination);
 
+    // Outdoor weather shelter sub-bus (muffles & dampens wind & rain in wood/cave zones)
+    this._outdoorShelterFilter = ctx.createBiquadFilter();
+    this._outdoorShelterFilter.type = 'lowpass';
+    this._outdoorShelterFilter.frequency.setValueAtTime(18000, now);
+    this._outdoorShelterFilter.Q.setValueAtTime(0.7, now);
+
+    this._outdoorShelterGain = ctx.createGain();
+    this._outdoorShelterGain.gain.setValueAtTime(1.0, now);
+
+    this._outdoorShelterFilter.connect(this._outdoorShelterGain);
+    this._outdoorShelterGain.connect(this._mixBus);
+
+    // Stone cavern warm feedback-delay echo bus (delay 0.16s, lowpass 1800 Hz, feedback 0.36, wet 0.42)
+    if (typeof ctx.createDelay === 'function') {
+      this._caveSendGain = ctx.createGain();
+      this._caveSendGain.gain.setValueAtTime(0.0, now);
+
+      this._caveDelay = ctx.createDelay(1.0);
+      this._caveDelay.delayTime.setValueAtTime(0.16, now);
+
+      this._caveLowpass = ctx.createBiquadFilter();
+      this._caveLowpass.type = 'lowpass';
+      this._caveLowpass.frequency.setValueAtTime(1800, now);
+      this._caveLowpass.Q.setValueAtTime(0.7, now);
+
+      this._caveFeedbackGain = ctx.createGain();
+      this._caveFeedbackGain.gain.setValueAtTime(0.36, now);
+
+      this._caveWetGain = ctx.createGain();
+      this._caveWetGain.gain.setValueAtTime(0.0, now);
+
+      this._caveSendGain.connect(this._caveDelay);
+      this._caveDelay.connect(this._caveLowpass);
+      this._caveLowpass.connect(this._caveFeedbackGain);
+      this._caveFeedbackGain.connect(this._caveDelay);
+      this._caveLowpass.connect(this._caveWetGain);
+      this._caveWetGain.connect(this._mixBus);
+    }
+
     // Pre-generate seamless looping 4-second noise buffers & transient burst buffers
     this._pinkBuffer = this._createSeamlessPinkBuffer(4.0);
     this._brownBuffer = this._createSeamlessBrownBuffer(4.0);
@@ -169,7 +277,7 @@ export class ProceduralAudio {
 
     windRoarSrc.connect(this._windRoarFilter);
     this._windRoarFilter.connect(this._windRoarGain);
-    this._windRoarGain.connect(this._mixBus);
+    this._windRoarGain.connect(this._outdoorShelterFilter);
 
     // 2. Airy Foliage Wind Rustle (pink noise -> bandpass 700–2400 Hz, Q 1.4)
     const windRustleSrc = this._createLoopingSource(this._pinkBuffer, 1.45);
@@ -183,7 +291,7 @@ export class ProceduralAudio {
 
     windRustleSrc.connect(this._windRustleFilter);
     this._windRustleFilter.connect(this._windRustleGain);
-    this._windRustleGain.connect(this._mixBus);
+    this._windRustleGain.connect(this._outdoorShelterFilter);
 
     // 3. Babbling Forest Stream (pink noise -> dual LFO-modulated resonant bandpasses)
     const streamSrc = this._createLoopingSource(this._pinkBuffer, 0.65);
@@ -249,7 +357,7 @@ export class ProceduralAudio {
     rainSrc.connect(rainHP);
     rainHP.connect(this._rainHighFilter);
     this._rainHighFilter.connect(this._rainGain);
-    this._rainGain.connect(this._mixBus);
+    this._rainGain.connect(this._outdoorShelterFilter);
 
     const rainBodyFilter = ctx.createBiquadFilter();
     rainBodyFilter.type = 'lowpass';
@@ -260,7 +368,7 @@ export class ProceduralAudio {
 
     rainSrc.connect(rainBodyFilter);
     rainBodyFilter.connect(this._rainBodyGain);
-    this._rainBodyGain.connect(this._mixBus);
+    this._rainBodyGain.connect(this._outdoorShelterFilter);
 
     // 5. Campfire Warm Low Rumble
     const fireSrc = this._createLoopingSource(this._brownBuffer, 2.15);
@@ -275,6 +383,9 @@ export class ProceduralAudio {
     fireSrc.connect(fireFilter);
     fireFilter.connect(this._fireRumbleGain);
     this._fireRumbleGain.connect(this._mixBus);
+
+    // Apply any acoustic zone configured before audio unlock
+    this._applyAcousticZone(0.02);
   }
 
   _createLoopingSource(buffer, offsetSeconds = 0) {
@@ -731,17 +842,23 @@ export class ProceduralAudio {
     }
   }
 
-  _connectToMix(node, pan = 0.0) {
+  _connectToMix(node, pan = 0.0, sendToCave = false) {
     const panner = Math.abs(pan) > 0.001 ? this._createPanner(pan) : null;
     if (panner) {
       node.connect(panner);
       panner.connect(this._mixBus);
+      if (sendToCave && this._caveSendGain) {
+        panner.connect(this._caveSendGain);
+      }
     } else {
       node.connect(this._mixBus);
+      if (sendToCave && this._caveSendGain) {
+        node.connect(this._caveSendGain);
+      }
     }
   }
 
-  _scheduleDropletPing(startTime, baseFreq, peakGain, pan = 0.0) {
+  _scheduleDropletPing(startTime, baseFreq, peakGain, pan = 0.0, sendToCave = false) {
     const ctx = this._ctx;
     const osc = ctx.createOscillator();
     osc.type = 'sine';
@@ -759,7 +876,7 @@ export class ProceduralAudio {
     env.gain.exponentialRampToValueAtTime(0.0001, startTime + dur);
 
     osc.connect(env);
-    this._connectToMix(env, pan);
+    this._connectToMix(env, pan, sendToCave);
 
     osc.start(startTime);
     osc.stop(startTime + dur + 0.01);
@@ -767,6 +884,9 @@ export class ProceduralAudio {
 
   /**
    * Synthesizes a surface-aware character footstep:
+   * - 'wood': warm hollow timber plank resonance + boot sole tap
+   * - 'bridge': deeper woody span thump + slight wooden plank creak
+   * - 'stone': crisp hard-heel mineral tap + tight cavern stone click
    * - 'grass': soft filtered foliage rustle (900–2400 Hz) + muted low heel thud (~95 Hz)
    * - 'dirt' / 'rock': crisp gritty gravel crunch (1800–4200 Hz) + punchy footfall thump (~110 Hz)
    * - 'water': frothy bandpass splash burst (600–2800 Hz) + shimmering droplet tail
@@ -781,6 +901,265 @@ export class ProceduralAudio {
 
     this._footstepSide = -this._footstepSide;
     const pan = this._footstepSide * 0.14 + (Math.random() - 0.5) * 0.06;
+
+    if (surf === 'wood') {
+      // 1. Warm hollow cabin floorboard timber resonance (primary + overtone body modes)
+      const bodyOscA = ctx.createOscillator();
+      bodyOscA.type = 'triangle';
+      const baseFreq = 162 + (Math.random() - 0.5) * 26;
+      bodyOscA.frequency.setValueAtTime(baseFreq, now);
+      bodyOscA.frequency.exponentialRampToValueAtTime(baseFreq * 0.58, now + 0.088);
+
+      const bodyOscB = ctx.createOscillator();
+      bodyOscB.type = 'sine';
+      const overtoneFreq = baseFreq * (1.84 + Math.random() * 0.18);
+      bodyOscB.frequency.setValueAtTime(overtoneFreq, now);
+      bodyOscB.frequency.exponentialRampToValueAtTime(overtoneFreq * 0.64, now + 0.065);
+
+      const woodBodyFilter = ctx.createBiquadFilter();
+      woodBodyFilter.type = 'bandpass';
+      woodBodyFilter.frequency.setValueAtTime(245 + Math.random() * 55, now);
+      woodBodyFilter.Q.setValueAtTime(1.85, now);
+
+      const bodyEnv = ctx.createGain();
+      bodyEnv.gain.setValueAtTime(0.0001, now);
+      bodyEnv.gain.linearRampToValueAtTime(0.24 * inten, now + 0.0045);
+      bodyEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.098);
+
+      const overtoneGain = ctx.createGain();
+      overtoneGain.gain.setValueAtTime(0.42, now);
+
+      bodyOscA.connect(woodBodyFilter);
+      bodyOscB.connect(overtoneGain);
+      overtoneGain.connect(woodBodyFilter);
+      woodBodyFilter.connect(bodyEnv);
+      this._connectToMix(bodyEnv, pan, true);
+
+      bodyOscA.start(now);
+      bodyOscB.start(now);
+      bodyOscA.stop(now + 0.11);
+      bodyOscB.stop(now + 0.09);
+
+      // 2. Crisp boot sole tap & warm plank knock transient
+      const knockSrc = ctx.createBufferSource();
+      knockSrc.buffer = this._pinkBuffer;
+      knockSrc.loop = true;
+
+      const knockFilter = ctx.createBiquadFilter();
+      knockFilter.type = 'bandpass';
+      knockFilter.frequency.setValueAtTime(620 + Math.random() * 190, now);
+      knockFilter.Q.setValueAtTime(2.9, now);
+
+      const knockEnv = ctx.createGain();
+      const knockDur = 0.048 + Math.random() * 0.016;
+      knockEnv.gain.setValueAtTime(0.0001, now);
+      knockEnv.gain.linearRampToValueAtTime(0.165 * inten, now + 0.003);
+      knockEnv.gain.exponentialRampToValueAtTime(0.0001, now + knockDur);
+
+      knockSrc.connect(knockFilter);
+      knockFilter.connect(knockEnv);
+      this._connectToMix(knockEnv, pan, true);
+      knockSrc.start(now, Math.random() * 3.0);
+      knockSrc.stop(now + knockDur + 0.015);
+
+      // 3. Boot sole leather/heel crisp top tap
+      const soleSrc = ctx.createBufferSource();
+      soleSrc.buffer = this._whiteBuffer;
+      soleSrc.loop = true;
+
+      const soleFilter = ctx.createBiquadFilter();
+      soleFilter.type = 'bandpass';
+      soleFilter.frequency.setValueAtTime(1650 + Math.random() * 480, now);
+      soleFilter.frequency.exponentialRampToValueAtTime(840 + Math.random() * 180, now + 0.036);
+      soleFilter.Q.setValueAtTime(2.0, now);
+
+      const soleEnv = ctx.createGain();
+      const soleDur = 0.034 + Math.random() * 0.012;
+      soleEnv.gain.setValueAtTime(0.0001, now);
+      soleEnv.gain.linearRampToValueAtTime(0.115 * inten, now + 0.0022);
+      soleEnv.gain.exponentialRampToValueAtTime(0.0001, now + soleDur);
+
+      soleSrc.connect(soleFilter);
+      soleFilter.connect(soleEnv);
+      this._connectToMix(soleEnv, pan, true);
+      soleSrc.start(now, Math.random() * 0.35);
+      soleSrc.stop(now + soleDur + 0.015);
+      return;
+    }
+
+    if (surf === 'bridge') {
+      // 1. Deeper hollow wooden bridge-span thump suspended over the stream
+      const spanOsc = ctx.createOscillator();
+      spanOsc.type = 'sine';
+      const spanBase = 114 + (Math.random() - 0.5) * 18;
+      spanOsc.frequency.setValueAtTime(spanBase, now);
+      spanOsc.frequency.exponentialRampToValueAtTime(52 + Math.random() * 8, now + 0.125);
+
+      const spanHarm = ctx.createOscillator();
+      spanHarm.type = 'triangle';
+      spanHarm.frequency.setValueAtTime(spanBase * 2.02, now);
+      spanHarm.frequency.exponentialRampToValueAtTime(spanBase * 1.08, now + 0.095);
+
+      const spanHarmGain = ctx.createGain();
+      spanHarmGain.gain.setValueAtTime(0.38, now);
+
+      const spanFilter = ctx.createBiquadFilter();
+      spanFilter.type = 'lowpass';
+      spanFilter.frequency.setValueAtTime(340 + Math.random() * 80, now);
+      spanFilter.Q.setValueAtTime(1.4, now);
+
+      const spanEnv = ctx.createGain();
+      spanEnv.gain.setValueAtTime(0.0001, now);
+      spanEnv.gain.linearRampToValueAtTime(0.28 * inten, now + 0.0055);
+      spanEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.135);
+
+      spanOsc.connect(spanFilter);
+      spanHarm.connect(spanHarmGain);
+      spanHarmGain.connect(spanFilter);
+      spanFilter.connect(spanEnv);
+      this._connectToMix(spanEnv, pan, true);
+
+      spanOsc.start(now);
+      spanHarm.start(now);
+      spanOsc.stop(now + 0.15);
+      spanHarm.stop(now + 0.12);
+
+      // 2. Heavy timber plank strike + boot sole slap
+      const plankSrc = ctx.createBufferSource();
+      plankSrc.buffer = this._pinkBuffer;
+      plankSrc.loop = true;
+
+      const plankFilter = ctx.createBiquadFilter();
+      plankFilter.type = 'bandpass';
+      plankFilter.frequency.setValueAtTime(760 + Math.random() * 220, now);
+      plankFilter.frequency.exponentialRampToValueAtTime(390 + Math.random() * 90, now + 0.062);
+      plankFilter.Q.setValueAtTime(1.65, now);
+
+      const plankEnv = ctx.createGain();
+      const plankDur = 0.062 + Math.random() * 0.022;
+      plankEnv.gain.setValueAtTime(0.0001, now);
+      plankEnv.gain.linearRampToValueAtTime(0.18 * inten, now + 0.0038);
+      plankEnv.gain.exponentialRampToValueAtTime(0.0001, now + plankDur);
+
+      plankSrc.connect(plankFilter);
+      plankFilter.connect(plankEnv);
+      this._connectToMix(plankEnv, pan, true);
+      plankSrc.start(now, Math.random() * 3.0);
+      plankSrc.stop(now + plankDur + 0.015);
+
+      // 3. Slight weathered bridge-plank creak (organic micro-groan on weight load)
+      const creakStart = now + 0.014 + Math.random() * 0.018;
+      const creakDur = 0.075 + Math.random() * 0.055;
+      const creakOsc = ctx.createOscillator();
+      creakOsc.type = 'sawtooth';
+      const cF0 = 360 + Math.random() * 170;
+      const cF1 = cF0 * (Math.random() > 0.45 ? 0.82 : 1.14);
+      creakOsc.frequency.setValueAtTime(cF0, creakStart);
+      creakOsc.frequency.exponentialRampToValueAtTime(cF1, creakStart + creakDur);
+
+      const creakFilter = ctx.createBiquadFilter();
+      creakFilter.type = 'bandpass';
+      creakFilter.frequency.setValueAtTime(cF0 * 2.2, creakStart);
+      creakFilter.Q.setValueAtTime(7.5, creakStart);
+
+      const creakEnv = ctx.createGain();
+      const creakPeak = (0.024 + Math.random() * 0.020) * inten;
+      creakEnv.gain.setValueAtTime(0.0001, creakStart);
+      creakEnv.gain.linearRampToValueAtTime(creakPeak, creakStart + creakDur * 0.28);
+      creakEnv.gain.exponentialRampToValueAtTime(0.0001, creakStart + creakDur);
+
+      creakOsc.connect(creakFilter);
+      creakFilter.connect(creakEnv);
+      this._connectToMix(creakEnv, pan, true);
+      creakOsc.start(creakStart);
+      creakOsc.stop(creakStart + creakDur + 0.015);
+      return;
+    }
+
+    if (surf === 'stone') {
+      // 1. Crisp hard-heel mineral tap click (tight high-mid transient)
+      const tapSrc = ctx.createBufferSource();
+      tapSrc.buffer = this._whiteBuffer;
+      tapSrc.loop = true;
+
+      const tapFilter = ctx.createBiquadFilter();
+      tapFilter.type = 'bandpass';
+      const tapF0 = 3050 + Math.random() * 1150;
+      tapFilter.frequency.setValueAtTime(tapF0, now);
+      tapFilter.frequency.exponentialRampToValueAtTime(1750 + Math.random() * 450, now + 0.036);
+      tapFilter.Q.setValueAtTime(2.35, now);
+
+      const tapEnv = ctx.createGain();
+      const tapDur = 0.034 + Math.random() * 0.014;
+      tapEnv.gain.setValueAtTime(0.0001, now);
+      tapEnv.gain.linearRampToValueAtTime(0.205 * inten, now + 0.0018);
+      tapEnv.gain.exponentialRampToValueAtTime(0.0001, now + tapDur);
+
+      tapSrc.connect(tapFilter);
+      tapFilter.connect(tapEnv);
+      this._connectToMix(tapEnv, pan, true);
+      tapSrc.start(now, Math.random() * 0.35);
+      tapSrc.stop(now + tapDur + 0.015);
+
+      // 2. Hard mineral stone ping formant (~1180–1580 Hz tight resonant knock)
+      const pingSrc = ctx.createBufferSource();
+      pingSrc.buffer = this._crackleBuffer;
+
+      const pingFilter = ctx.createBiquadFilter();
+      pingFilter.type = 'bandpass';
+      pingFilter.frequency.setValueAtTime(1180 + Math.random() * 420, now);
+      pingFilter.Q.setValueAtTime(5.2, now);
+
+      const pingEnv = ctx.createGain();
+      const pingDur = 0.044 + Math.random() * 0.014;
+      pingEnv.gain.setValueAtTime(0.0001, now);
+      pingEnv.gain.linearRampToValueAtTime(0.155 * inten, now + 0.002);
+      pingEnv.gain.exponentialRampToValueAtTime(0.0001, now + pingDur);
+
+      pingSrc.connect(pingFilter);
+      pingFilter.connect(pingEnv);
+      this._connectToMix(pingEnv, pan, true);
+      pingSrc.start(now, Math.random() * 0.025, pingDur + 0.01);
+      pingSrc.stop(now + pingDur + 0.015);
+
+      // 3. Dense crisp boot-heel rock impact impulse (~145 -> 68 Hz)
+      const heelOsc = ctx.createOscillator();
+      heelOsc.type = 'triangle';
+      heelOsc.frequency.setValueAtTime(144 + (Math.random() - 0.5) * 18, now);
+      heelOsc.frequency.exponentialRampToValueAtTime(66, now + 0.042);
+
+      const heelEnv = ctx.createGain();
+      heelEnv.gain.setValueAtTime(0.0001, now);
+      heelEnv.gain.linearRampToValueAtTime(0.17 * inten, now + 0.0022);
+      heelEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.052);
+
+      heelOsc.connect(heelEnv);
+      this._connectToMix(heelEnv, pan, true);
+      heelOsc.start(now);
+      heelOsc.stop(now + 0.062);
+
+      // 4. Subtle fine mineral grit micro-scuff on sole roll-off
+      const gritTime = now + 0.012 + Math.random() * 0.008;
+      const gritSrc = ctx.createBufferSource();
+      gritSrc.buffer = this._whiteBuffer;
+      gritSrc.loop = true;
+
+      const gritHP = ctx.createBiquadFilter();
+      gritHP.type = 'highpass';
+      gritHP.frequency.setValueAtTime(3200 + Math.random() * 900, gritTime);
+
+      const gritEnv = ctx.createGain();
+      gritEnv.gain.setValueAtTime(0.0001, gritTime);
+      gritEnv.gain.linearRampToValueAtTime(0.055 * inten, gritTime + 0.003);
+      gritEnv.gain.exponentialRampToValueAtTime(0.0001, gritTime + 0.026);
+
+      gritSrc.connect(gritHP);
+      gritHP.connect(gritEnv);
+      this._connectToMix(gritEnv, pan, true);
+      gritSrc.start(gritTime, Math.random() * 0.35);
+      gritSrc.stop(gritTime + 0.036);
+      return;
+    }
 
     if (surf === 'water') {
       // Frothy splash body (600–1350 Hz) + airy spray burst (1750–2800 Hz)
@@ -802,7 +1181,7 @@ export class ProceduralAudio {
 
       bodySrc.connect(bodyFilter);
       bodyFilter.connect(bodyEnv);
-      this._connectToMix(bodyEnv, pan);
+      this._connectToMix(bodyEnv, pan, true);
       bodySrc.start(now, Math.random() * 3.0);
       bodySrc.stop(now + bodyDur + 0.02);
 
@@ -825,7 +1204,7 @@ export class ProceduralAudio {
 
       frothSrc.connect(frothFilter);
       frothFilter.connect(frothEnv);
-      this._connectToMix(frothEnv, pan);
+      this._connectToMix(frothEnv, pan, true);
       frothSrc.start(now, Math.random() * 0.35);
       frothSrc.stop(now + frothDur + 0.02);
 
@@ -839,7 +1218,7 @@ export class ProceduralAudio {
       thudEnv.gain.linearRampToValueAtTime(0.095 * inten, now + 0.006);
       thudEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.075);
       thud.connect(thudEnv);
-      this._connectToMix(thudEnv, pan);
+      this._connectToMix(thudEnv, pan, true);
       thud.start(now);
       thud.stop(now + 0.085);
 
@@ -849,7 +1228,7 @@ export class ProceduralAudio {
         const dt = 0.055 + d * 0.048 + Math.random() * 0.035;
         const dropFreq = 1100 + Math.random() * 1450;
         const dropPan = clamp(pan + (Math.random() - 0.5) * 0.45, -1, 1);
-        this._scheduleDropletPing(now + dt, dropFreq, 0.028 * inten * (0.7 + Math.random() * 0.4), dropPan);
+        this._scheduleDropletPing(now + dt, dropFreq, 0.028 * inten * (0.7 + Math.random() * 0.4), dropPan, true);
       }
       return;
     }
@@ -878,7 +1257,7 @@ export class ProceduralAudio {
 
       gritSrc.connect(gritFilter);
       gritFilter.connect(gritEnv);
-      this._connectToMix(gritEnv, pan);
+      this._connectToMix(gritEnv, pan, true);
       gritSrc.start(now, Math.random() * 0.35);
       gritSrc.stop(now + gritDur + 0.015);
 
@@ -897,7 +1276,7 @@ export class ProceduralAudio {
       scuffEnv.gain.exponentialRampToValueAtTime(0.0001, scuffTime + 0.042);
       scuffSrc.connect(scuffFilter);
       scuffFilter.connect(scuffEnv);
-      this._connectToMix(scuffEnv, pan);
+      this._connectToMix(scuffEnv, pan, true);
       scuffSrc.start(scuffTime, Math.random() * 0.35);
       scuffSrc.stop(scuffTime + 0.05);
 
@@ -914,7 +1293,7 @@ export class ProceduralAudio {
       thumpEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.072);
 
       thump.connect(thumpEnv);
-      this._connectToMix(thumpEnv, pan);
+      this._connectToMix(thumpEnv, pan, true);
       thump.start(now);
       thump.stop(now + 0.082);
       return;
@@ -941,7 +1320,7 @@ export class ProceduralAudio {
 
     rustleSrc.connect(rustleFilter);
     rustleFilter.connect(rustleEnv);
-    this._connectToMix(rustleEnv, pan);
+    this._connectToMix(rustleEnv, pan, true);
     rustleSrc.start(now, Math.random() * 3.0);
     rustleSrc.stop(now + rustleDur + 0.02);
 
@@ -957,7 +1336,7 @@ export class ProceduralAudio {
     heelEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.078);
 
     heelOsc.connect(heelEnv);
-    this._connectToMix(heelEnv, pan);
+    this._connectToMix(heelEnv, pan, true);
     heelOsc.start(now);
     heelOsc.stop(now + 0.09);
   }
@@ -1176,7 +1555,7 @@ export class ProceduralAudio {
     throatFormant.connect(env);
     airwayFormant.connect(airwayGain);
     airwayGain.connect(env);
-    env.connect(this._mixBus);
+    this._connectToMix(env, 0.0, true);
 
     src.start(now, Math.random() * 3.0);
     src.stop(now + dur + 0.02);
@@ -1201,7 +1580,7 @@ export class ProceduralAudio {
 
     glottalOsc.connect(glottalFilter);
     glottalFilter.connect(glottalEnv);
-    glottalEnv.connect(this._mixBus);
+    this._connectToMix(glottalEnv, 0.0, true);
 
     glottalOsc.start(glottalTime);
     glottalOsc.stop(glottalTime + 0.12);
@@ -1344,7 +1723,7 @@ export class ProceduralAudio {
 
     crackSrc.connect(crackFilter);
     crackFilter.connect(crackEnv);
-    this._connectToMix(crackEnv, pan);
+    this._connectToMix(crackEnv, pan, true);
     crackSrc.start(now, Math.random() * 0.35);
     crackSrc.stop(now + 0.45);
 
@@ -1389,7 +1768,7 @@ export class ProceduralAudio {
     pinkMixGain.connect(subHP);
     subHP.connect(subLP);
     subLP.connect(rumbleEnv);
-    this._connectToMix(rumbleEnv, pan * 0.5);
+    this._connectToMix(rumbleEnv, pan * 0.5, true);
 
     brownSrc.start(now, Math.random() * 3.0);
     pinkSrc.start(now, Math.random() * 3.0);
@@ -1408,7 +1787,7 @@ export class ProceduralAudio {
     subBoomEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.52);
 
     subBoom.connect(subBoomEnv);
-    subBoomEnv.connect(this._mixBus);
+    this._connectToMix(subBoomEnv, 0.0, true);
     subBoom.start(now + 0.015);
     subBoom.stop(now + 0.56);
   }

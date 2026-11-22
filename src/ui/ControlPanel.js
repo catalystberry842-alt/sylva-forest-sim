@@ -2,14 +2,14 @@ import GUI from 'lil-gui';
 import Stats from 'stats.js';
 
 /**
- * Interactive lil-gui forest, character & wildlife control suite + Stats.js FPS monitor.
+ * Interactive lil-gui forest, character, wildlife, structures & mobile controls suite + Stats.js monitor.
  */
 export class ControlPanel {
   constructor(state = {}, callbacks = {}) {
     this.state = state;
     this.callbacks = callbacks;
 
-    // Ensure expected state defaults exist without overriding provided values
+    // Defaults
     if (this.state.timeOfDay === undefined) this.state.timeOfDay = 9.25;
     if (this.state.autoCycle === undefined) this.state.autoCycle = true;
     if (this.state.cycleSpeed === undefined) this.state.cycleSpeed = 0.12;
@@ -23,6 +23,7 @@ export class ControlPanel {
     if (this.state.sprintSpeed === undefined) this.state.sprintSpeed = 1.0;
     if (this.state.infiniteStamina === undefined) this.state.infiniteStamina = false;
     if (this.state.wildlifePopulation === undefined) this.state.wildlifePopulation = 1.0;
+    if (this.state.showTouchControls === undefined) this.state.showTouchControls = false;
     if (this.state.quality === undefined) this.state.quality = 'High';
 
     // FPS Monitor (Stats.js)
@@ -34,7 +35,7 @@ export class ControlPanel {
     // Collapsible lil-gui Control Panel
     this.gui = new GUI({ title: 'Forest Controls', width: 282 });
 
-    // 1. Character & Wildlife (primary playable controls)
+    // 1. Character & Wildlife
     const characterFolder = this.gui.addFolder('Character & Wildlife');
     characterFolder
       .add(this.state, 'cameraMode', ['Third-Person', 'First-Person Body', 'Free Orbit'])
@@ -42,6 +43,14 @@ export class ControlPanel {
       .listen()
       .onChange((value) => {
         this.callbacks.onCameraModeChange?.(value, this.state);
+      });
+
+    characterFolder
+      .add(this.state, 'showTouchControls')
+      .name('Show Touch Controls')
+      .listen()
+      .onChange((value) => {
+        this.callbacks.onToggleTouchControls?.(value, this.state);
       });
 
     characterFolder
@@ -72,7 +81,25 @@ export class ControlPanel {
     characterFolder.add(wildlifeActions, 'triggerRatScare').name('Trigger Rat Scare (Key: R)');
     characterFolder.add(wildlifeActions, 'triggerStreamSlip').name('Trigger Stream Slip');
 
-    // 2. Atmosphere & Sky
+    // 2. Explore Structures (quick travel to all 4 walkable interiors/structures)
+    const structuresFolder = this.gui.addFolder('Explore Structures');
+    const travel = {
+      clearing: () => this.callbacks.onTeleport?.('clearing'),
+      cabinPorch: () => this.callbacks.onTeleport?.('cabinPorch'),
+      cabinInterior: () => this.callbacks.onTeleport?.('cabinInterior'),
+      bridgeCenter: () => this.callbacks.onTeleport?.('bridgeCenter'),
+      redwoodInterior: () => this.callbacks.onTeleport?.('redwoodInterior'),
+      cavernInterior: () => this.callbacks.onTeleport?.('cavernInterior'),
+    };
+    structuresFolder.add(travel, 'cabinPorch').name('Ranger Cabin Porch');
+    structuresFolder.add(travel, 'cabinInterior').name('Inside Ranger Cabin');
+    structuresFolder.add(travel, 'bridgeCenter').name('Wooden Stream Bridge');
+    structuresFolder.add(travel, 'redwoodInterior').name('Inside Hollow Redwood');
+    structuresFolder.add(travel, 'cavernInterior').name('Inside Stone Cavern');
+    structuresFolder.add(travel, 'clearing').name('Campfire Clearing');
+    structuresFolder.close();
+
+    // 3. Atmosphere & Sky
     const atmosphereFolder = this.gui.addFolder('Atmosphere & Sky');
     atmosphereFolder
       .add(this.state, 'timeOfDay', 0, 24, 0.05)
@@ -117,7 +144,7 @@ export class ControlPanel {
         this.callbacks.onAtmosphereChange?.(this.state);
       });
 
-    // 3. Wind Simulation (collapsed cleanly to keep panel tidy)
+    // 4. Wind Simulation (collapsed cleanly)
     const windFolder = this.gui.addFolder('Wind Simulation');
     windFolder
       .add(this.state, 'windSpeed', 0, 3.5, 0.05)
@@ -141,7 +168,7 @@ export class ControlPanel {
       });
     windFolder.close();
 
-    // 4. Graphics & Quick Actions
+    // 5. Quality & Quick Actions
     const actionsFolder = this.gui.addFolder('Quality & Quick Actions');
     actionsFolder
       .add(this.state, 'quality', ['Medium', 'High', 'Ultra'])

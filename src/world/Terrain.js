@@ -162,6 +162,49 @@ export class Terrain {
       }
     }
 
+    // Surgical Grade 1: Ranger Cabin Terrace at (17.2, -1.8)
+    // Smoothly levels a compact pad (core r = 4.6, feather r = 8.2) to y = 2.45
+    // so the cabin foundation and 3 porch steps sit flush facing southwest toward the clearing.
+    const dxCabin = x - 17.2;
+    const dzCabin = z - -1.8;
+    const distCabin = Math.sqrt(dxCabin * dxCabin + dzCabin * dzCabin);
+    if (distCabin < 8.2) {
+      const cabinBlend = 1.0 - smootherstep(4.6, 8.2, distCabin);
+      h = lerp(h, 2.45, cabinBlend);
+    }
+
+    // Surgical Grade 2: Mossy Stone Cavern Floor Cove at (26.8, 14.5)
+    // Entrance faces northwest toward clearing along (-0.82, -0.57).
+    // Depresses a flat rocky chamber (y = 4.20, core r = 3.8, feather r = 7.2) plus
+    // a gentle clearing-facing approach ramp while keeping the rear hillside (x > 29, z > 16) high.
+    const dxCav = x - 26.8;
+    const dzCav = z - 14.5;
+    const distCav = Math.sqrt(dxCav * dxCav + dzCav * dzCav);
+    if (distCav < 7.2) {
+      const coveBlend = 1.0 - smootherstep(3.8, 7.2, distCav);
+      h = lerp(h, 4.2, coveBlend);
+    }
+
+    // Gentle entrance approach ramp cutting cleanly from doorway (along = 3.4) toward clearing (along = 11.4)
+    const cavFx = -0.821107;
+    const cavFz = -0.570774;
+    const cavAlong = dxCav * cavFx + dzCav * cavFz;
+    if (cavAlong > 1.2 && cavAlong < 13.0) {
+      const cavAcross = Math.abs(-dxCav * cavFz + dzCav * cavFx);
+      if (cavAcross < 6.4) {
+        const latMask = 1.0 - smootherstep(2.3, 6.4, cavAcross);
+        const inMask = smoothstep(1.2, 2.8, cavAlong);
+        const outMask = 1.0 - smootherstep(9.6, 13.0, cavAlong);
+        const rampMask = latMask * inMask * outMask;
+        if (rampMask > 0.0) {
+          const linT = clamp((cavAlong - 4.2) / 7.2, 0, 1);
+          const easeT = lerp(linT, smoothstep(0.0, 1.0, linT), 0.35);
+          const rampY = lerp(4.2, 2.25, easeT);
+          h = lerp(h, Math.min(h, rampY), rampMask);
+        }
+      }
+    }
+
     return h;
   }
 
@@ -236,12 +279,17 @@ export class Terrain {
     };
 
     const heightBuf = new Float32Array(size * size);
-    const albedoCanvas = document.createElement('canvas');
-    albedoCanvas.width = size;
-    albedoCanvas.height = size;
-    const actx = albedoCanvas.getContext('2d');
-    const aImg = actx.createImageData(size, size);
-    const ad = aImg.data;
+    let ad;
+    if (typeof document !== 'undefined') {
+      const albedoCanvas = document.createElement('canvas');
+      albedoCanvas.width = size;
+      albedoCanvas.height = size;
+      const actx = albedoCanvas.getContext('2d');
+      const aImg = actx.createImageData(size, size);
+      ad = aImg.data;
+    } else {
+      ad = new Uint8ClampedArray(size * size * 4);
+    }
 
     // Pre-generate pebbles/needles data for rich detail
     const pebbles = [];
